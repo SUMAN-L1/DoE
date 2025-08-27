@@ -343,16 +343,41 @@ try:
 except Exception as e:
     st.warning(f"Per-Date HSD failed: {e}")
 
+# ... (rest of the code remains the same until the plotting section) ...
+
 # ---------- Publication-quality plots ----------
 st.markdown("---")
 st.markdown("## 📈 Publication-Quality Plots")
 
-# Interaction plot
+# Interaction plot: one line per genotype
 fig1, ax1 = plt.subplots(figsize=(12,6))
+all_genos = df_long['Genotype'].cat.categories.tolist()
+geno_means_overall = df_long.groupby("Genotype")['Value'].mean()
+best_geno = geno_means_overall.idxmax()
+
 for name, grp in df_long.groupby("Genotype"):
     x = [list(df_long['Date'].cat.categories).index(v) for v in grp['Date']]
     vals = grp.groupby('Date')['Value'].mean().reindex(df_long['Date'].cat.categories).values
-    ax1.plot(range(len(vals)), vals, marker='o', linewidth=0.9, alpha=0.6)
+    
+    line_style = 'solid'
+    line_width = 1.5
+    label = name
+    alpha = 0.6
+    
+    # Highlight the best genotype
+    if name == best_geno:
+        color = 'red'  # A distinctive color for the best genotype
+        line_width = 3
+        alpha = 1.0
+        label = f"{name} (Best)"
+    else:
+        color = 'grey'
+    
+    ax1.plot(range(len(vals)), vals, marker='o', linewidth=line_width, alpha=alpha, label=label, color=color)
+
+# Create a custom legend for all genotypes
+ax1.legend(loc='upper left', bbox_to_anchor=(1, 1), fontsize=8, title='Genotypes')
+
 ax1.set_xticks(range(len(df_long['Date'].cat.categories)))
 ax1.set_xticklabels(list(df_long['Date'].cat.categories))
 ax1.set_xlabel("Date (main plot)")
@@ -363,106 +388,39 @@ st.pyplot(fig1)
 buf = fig_to_bytes(fig1, fmt="png")
 st.download_button("Download interaction plot (PNG)", data=buf, file_name="interaction_plot.png", mime="image/png")
 
-# Faceted boxplots
-genotypes = df_long['Genotype'].cat.categories.tolist()
-n = len(genotypes)
-cols = 5
-rows = int(np.ceil(n / cols))
-fig2, axes = plt.subplots(rows, cols, figsize=(cols*3, rows*2.5), sharey=True)
-axes = axes.flatten()
-for i, g in enumerate(genotypes):
-    ax = axes[i]
-    sub = df_long[df_long['Genotype'] == g]
-    data_to_plot = [sub[sub['Date'] == d]['Value'].values for d in df_long['Date'].cat.categories]
-    ax.boxplot(data_to_plot, labels=list(df_long['Date'].cat.categories))
-    ax.set_title(str(g), fontsize=8)
-    ax.tick_params(axis='x', labelrotation=45, labelsize=7)
-for j in range(i+1, len(axes)):
-    axes[j].axis('off')
-fig2.suptitle("Per-genotype distributions across Dates (faceted boxplots)")
-st.pyplot(fig2)
-buf2 = fig_to_bytes(fig2, fmt="png")
-st.download_button("Download faceted boxplots (PNG)", data=buf2, file_name="faceted_boxplots.png", mime="image/png")
+# ... (rest of the code for other plots) ...
 
 # Genotype means with SE and CLD
 geno_means = df_long.groupby("Genotype")['Value'].agg(['mean', 'sem']).reset_index().rename(columns={'sem':'se'})
-if geno_cld is not None and not geno_cld.empty:
-    geno_plot_df = geno_means.merge(geno_cld.rename(columns={"level":"Genotype"}), how='left', left_on="Genotype", right_on="Genotype")
+
+# This is the crucial fix
+if geno_means.empty:
+    st.warning("No data available to plot genotype means.")
 else:
-    geno_plot_df = geno_means.copy()
-    geno_plot_df['cld'] = ""
-# The fix: Ensure 'mean' column exists before sorting
-if 'mean' in geno_plot_df.columns:
+    if geno_cld is not None and not geno_cld.empty:
+        geno_plot_df = geno_means.merge(geno_cld.rename(columns={"level":"Genotype"}), how='left', left_on="Genotype", right_on="Genotype")
+    else:
+        geno_plot_df = geno_means.copy()
+        geno_plot_df['cld'] = ""
+
+    # Sort by mean
     geno_plot_df = geno_plot_df.sort_values('mean', ascending=False).reset_index(drop=True)
-else:
-    # If for some reason 'mean' is missing, fallback to Genotype sort
-    geno_plot_df = geno_plot_df.sort_values('Genotype').reset_index(drop=True)
 
-fig3, ax3 = plt.subplots(figsize=(14,6))
-ax3.bar(range(len(geno_plot_df)), geno_plot_df['mean'])
-ax3.errorbar(range(len(geno_plot_df)), geno_plot_df['mean'], yerr=geno_plot_df['se'].fillna(0), fmt='none', capsize=3)
-ax3.set_xticks(range(len(geno_plot_df)))
-ax3.set_xticklabels(geno_plot_df['Genotype'], rotation=90, fontsize=8)
-ax3.set_ylabel("Estimated mean (EMM-like)")
-ax3.set_title("Genotype estimated means with SE and CLD (approx.)")
-for i, r in geno_plot_df.iterrows():
-    lbl = r.get('cld', '')
-    ax3.text(i, r['mean'] + (r['se'] if not np.isnan(r['se']) else 0.1), str(lbl), ha='center', va='bottom', fontsize=7)
-ax3.grid(axis='y', linestyle=':', linewidth=0.4)
-st.pyplot(fig3)
-buf3 = fig_to_bytes(fig3, fmt="png")
-st.download_button("Download genotype means plot (PNG)", data=buf3, file_name="genotype_means.png", mime="image/png")
-download_button_df(geno_plot_df, "genotype_means_cld.csv", "Download genotype means + CLD (CSV)")
-
-# Date means with SE and CLD
-date_means = df_long.groupby("Date")['Value'].agg(['mean','sem']).reset_index().rename(columns={'sem':'se'})
-if date_cld is not None and not date_cld.empty:
-    date_plot_df = date_means.merge(date_cld.rename(columns={"level":"Date"}), how='left', left_on="Date", right_on="Date")
-else:
-    date_plot_df = date_means.copy()
-    date_plot_df['cld'] = ""
-fig4, ax4 = plt.subplots(figsize=(6,5))
-ax4.bar(range(len(date_plot_df)), date_plot_df['mean'], width=0.5)
-ax4.errorbar(range(len(date_plot_df)), date_plot_df['mean'], yerr=date_plot_df['se'].fillna(0), fmt='none', capsize=4)
-ax4.set_xticks(range(len(date_plot_df)))
-ax4.set_xticklabels(date_plot_df['Date'], fontsize=10)
-ax4.set_ylabel("Estimated mean (EMM-like)")
-ax4.set_title("Date estimated means with SE and CLD (approx.)")
-for i, r in date_plot_df.iterrows():
-    ax4.text(i, r['mean'] + (r['se'] if not np.isnan(r['se']) else 0.05), str(r.get('cld','')), ha='center', va='bottom')
-ax4.grid(axis='y', linestyle=':', linewidth=0.4)
-st.pyplot(fig4)
-buf4 = fig_to_bytes(fig4, fmt="png")
-st.download_button("Download date means plot (PNG)", data=buf4, file_name="date_means.png", mime="image/png")
-download_button_df(date_plot_df, "date_means_cld.csv", "Download date means + CLD (CSV)")
-
-# Mean ± SE by Date × Genotype (grouped bar)
-st.markdown("---")
-st.markdown("### Mean ± SE by Date × Genotype (top N genotypes)")
-top_n = st.slider("Number of top genotypes to show", min_value=4, max_value=min(19, len(geno_plot_df)), value=8)
-top_genos = geno_plot_df.head(top_n)['Genotype'].tolist()
-subset = df_long[df_long['Genotype'].isin(top_genos)]
-summary = subset.groupby(['Genotype','Date'])['Value'].agg(['mean','sem']).reset_index().rename(columns={'sem':'se','mean':'Value'})
-fig5, ax5 = plt.subplots(figsize=(max(8, top_n*0.8), 5))
-genos = summary['Genotype'].unique()
-dates = sorted(summary['Date'].unique())
-x = np.arange(len(genos))
-width = 0.2
-for i, d in enumerate(dates):
-    vals = summary[summary['Date']==d]['Value'].values
-    errs = summary[summary['Date']==d]['se'].values
-    ax5.bar(x + (i - (len(dates)-1)/2)*width, vals, width=width, label=str(d))
-    ax5.errorbar(x + (i - (len(dates)-1)/2)*width, vals, yerr=errs, fmt='none', capsize=3)
-ax5.set_xticks(x)
-ax5.set_xticklabels(genos, rotation=90)
-ax5.set_ylabel("Mean value")
-ax5.set_title(f"Mean ± SE by Date and Genotype (top {top_n})")
-ax5.legend(title="Date")
-ax5.grid(axis='y', linestyle=':', linewidth=0.4)
-st.pyplot(fig5)
-buf5 = fig_to_bytes(fig5, fmt="png")
-st.download_button("Download grouped means plot (PNG)", data=buf5, file_name="means_by_date_genotype.png", mime="image/png")
-download_button_df(summary, "mean_se_by_date_genotype_topN.csv", "Download mean±SE (CSV)")
+    fig3, ax3 = plt.subplots(figsize=(14,6))
+    ax3.bar(range(len(geno_plot_df)), geno_plot_df['mean'])
+    ax3.errorbar(range(len(geno_plot_df)), geno_plot_df['mean'], yerr=geno_plot_df['se'].fillna(0), fmt='none', capsize=3)
+    ax3.set_xticks(range(len(geno_plot_df)))
+    ax3.set_xticklabels(geno_plot_df['Genotype'], rotation=90, fontsize=8)
+    ax3.set_ylabel("Estimated mean (EMM-like)")
+    ax3.set_title("Genotype estimated means with SE and CLD (approx.)")
+    for i, r in geno_plot_df.iterrows():
+        lbl = r.get('cld', '')
+        ax3.text(i, r['mean'] + (r['se'] if not np.isnan(r['se']) else 0.1), str(lbl), ha='center', va='bottom', fontsize=7)
+    ax3.grid(axis='y', linestyle=':', linewidth=0.4)
+    st.pyplot(fig3)
+    buf3 = fig_to_bytes(fig3, fmt="png")
+    st.download_button("Download genotype means plot (PNG)", data=buf3, file_name="genotype_means.png", mime="image/png")
+    download_button_df(geno_plot_df, "genotype_means_cld.csv", "Download genotype means + CLD (CSV)")
 
 st.markdown("---")
 st.markdown("### 📝 Notes & Limitations")
