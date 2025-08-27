@@ -207,7 +207,7 @@ st.markdown(
 
 # Subtitle with style
 st.markdown(
-    "<h2 style='text-align: center; color: black;'>Developed by Bhavya</h2>", 
+    "<h3 style='text-align: center; color: black;'>Developed by Bhavya</h3>", 
     unsafe_allow_html=True
 )
 st.markdown("""
