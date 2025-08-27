@@ -242,7 +242,7 @@ g19,36.62,36.98,36.18,36.86,40.56,38.92,37.69
 """
 
 uploaded_file = st.file_uploader("Upload CSV/XLSX file", type=["csv","xlsx","xls"])
-use_example = st.checkbox("Use example dataset (ignore upload)", value=True)
+use_example = st.checkbox("Use example dataset (ignore upload)", value=False)
 
 if uploaded_file is None and not use_example:
     st.info("Upload a file or check 'Use example dataset'.")
