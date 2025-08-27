@@ -108,51 +108,6 @@ def detect_split_plot_structure(df):
     except:
         return False
 
-def transform_genotype_data(df):
-    """Transform genotype-treatment data to long format"""
-    try:
-        # Get the genotype column (first column)
-        genotype_col = df.columns[0]
-        genotypes = df[genotype_col].dropna()
-        
-        # Get treatment columns (excluding genotype column)
-        treatment_cols = [col for col in df.columns if col != genotype_col]
-        
-        # Parse treatment structure (d1_r1, d1_r2, etc.)
-        long_data = []
-        
-        for idx, genotype in enumerate(genotypes):
-            for col in treatment_cols:
-                if pd.notna(df.iloc[idx][col]) and df.iloc[idx][col] != '':
-                    # Parse treatment and replication
-                    if '_' in col or 'r' in col:
-                        # Handle formats like "d1_r1" or column headers with treatments
-                        parts = col.split('_') if '_' in col else [col]
-                        treatment = parts[0] if parts else col
-                        replication = parts[1] if len(parts) > 1 else 'r1'
-                    else:
-                        treatment = col
-                        replication = 'r1'
-                    
-                    long_data.append({
-                        'Genotype': genotype,
-                        'Treatment': treatment,
-                        'Replication': replication,
-                        'Response': df.iloc[idx][col]
-                    })
-        
-        df_long = pd.DataFrame(long_data)
-        
-        # Clean and convert response to numeric
-        df_long['Response'] = pd.to_numeric(df_long['Response'], errors='coerce')
-        df_long = df_long.dropna(subset=['Response'])
-        
-        return df_long
-        
-    except Exception as e:
-        st.error(f"Error in data transformation: {str(e)}")
-        return None
-
 def auto_transform_wide_data(df):
     """Automatically transform wide format data based on column structure"""
     try:
