@@ -520,40 +520,6 @@ st.pyplot(fig2)
 buf2 = fig_to_bytes(fig2, fmt="png")
 st.download_button("Download faceted boxplots (PNG)", data=buf2, file_name="faceted_boxplots.png", mime="image/png")
 
-# Genotype means with SE and CLD (same as before)
-st.markdown("### Genotype Means with SE and CLD")
-geno_means = df_long.groupby("Genotype")['Value'].agg(['mean', 'sem']).reset_index().rename(columns={'sem':'se'})
-if geno_means.empty:
-    st.warning("No data available to plot genotype means.")
-else:
-    if geno_cld is not None and not geno_cld.empty:
-        geno_plot_df = geno_means.merge(geno_cld.rename(columns={"level":"Genotype"}), how='left', left_on="Genotype", right_on="Genotype")
-    else:
-        geno_plot_df = geno_means.copy()
-        geno_plot_df['cld'] = ""
-    # Explicitly check for 'mean' column before sorting
-    if 'mean' in geno_plot_df.columns:
-        geno_plot_df = geno_plot_df.sort_values('mean', ascending=False).reset_index(drop=True)
-    else:
-        st.warning("Could not find 'mean' column for sorting. Displaying unsorted data.")
-        geno_plot_df = geno_plot_df.reset_index(drop=True)
-
-    fig3, ax3 = plt.subplots(figsize=(14,6))
-    ax3.bar(range(len(geno_plot_df)), geno_plot_df['mean'])
-    ax3.errorbar(range(len(geno_plot_df)), geno_plot_df['mean'], yerr=geno_plot_df['se'].fillna(0), fmt='none', capsize=3)
-    ax3.set_xticks(range(len(geno_plot_df)))
-    ax3.set_xticklabels(geno_plot_df['Genotype'], rotation=90, fontsize=8)
-    ax3.set_ylabel("Estimated mean (EMM-like)")
-    ax3.set_title("Genotype estimated means with SE and CLD (approx.)")
-    for i, r in geno_plot_df.iterrows():
-        lbl = r.get('cld', '')
-        ax3.text(i, r['mean'] + (r['se'] if not np.isnan(r['se']) else 0.1), str(lbl), ha='center', va='bottom', fontsize=7)
-    ax3.grid(axis='y', linestyle=':', linewidth=0.4)
-    st.pyplot(fig3)
-    buf3 = fig_to_bytes(fig3, fmt="png")
-    st.download_button("Download genotype means plot (PNG)", data=buf3, file_name="genotype_means.png", mime="image/png")
-    download_button_df(geno_plot_df, "genotype_means_cld.csv", "Download genotype means + CLD (CSV)")
-
 # Date means with SE and CLD (same as before)
 st.markdown("### Date Means with SE and CLD")
 date_means = df_long.groupby("Date")['Value'].agg(['mean','sem']).reset_index().rename(columns={'sem':'se'})
