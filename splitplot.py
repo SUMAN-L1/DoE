@@ -1,439 +1,858 @@
-# split_plot_analyser_app.py
-# -------------------------------------------------------------------
-# Split plot analyser — Streamlit app
-# Developed by Bhavya
-#
-# This version is tuned to your exact data structure:
-# - Rows: genotypes (g1 .. g19) — MAIN PLOT factor
-# - Columns: two header rows: top = days (d1, d2, d3), second = replications (r1, r2)
-#   These are merged to column names like "d1_r1", "d2_r2", etc.
-# - The app:
-#    1) Reads CSV/XLS/XLSX files with two header rows and merges headers
-#    2) Drops any 'Mean' column
-#    3) Transforms to long format: Genotype, Treatment (day), Replication, Response
-#    4) Runs OLS ANOVA: Response ~ C(Genotype) * C(Treatment) (Type II or Type III selectable)
-#    5) Optionally fits a Mixed Effects model (random intercept for Genotype) — recommended for split-plot
-#    6) Computes post-hoc pairwise contrasts (contrast estimate, SE, df, t.ratio, p.value, Significance)
-#       — contrasts use the residual MSE from the OLS ANOVA to compute SE (classic approach).
-#    7) Also provides statsmodels Tukey HSD for Treatments (if applicable)
-#    8) Produces publication-quality Plotly visuals and diagnostic plots
-#    9) Exports: long data, ANOVA table, post-hoc table, report
-#
-# Note about split-plot inference:
-# - For full split-plot inference with separate whole-plot and subplot error terms, a mixed-effects
-#   model (or specialized split-plot routine) is more appropriate. The app fits a mixed model
-#   optionally and displays its summary, but pairwise contrasts are computed from the OLS residual MSE
-#   for transparency and because getting correct SE/df for contrasts from mixed models requires
-#   more advanced marginal means code (not in base statsmodels).
-# -------------------------------------------------------------------
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-from pathlib import Path
-from io import BytesIO, StringIO
-import warnings
-warnings.filterwarnings("ignore")
-
-# Stats & plotting
-import statsmodels.api as sm
-from statsmodels.formula.api import ols
-from statsmodels.stats.anova import anova_lm
-from statsmodels.stats.multicomp import pairwise_tukeyhsd
-from scipy import stats
-from scipy.stats import t as tdist
 import plotly.express as px
 import plotly.graph_objects as go
-from textwrap import dedent
+from plotly.subplots import make_subplots
+from scipy import stats
+from scipy.stats import f_oneway
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+from statsmodels.stats.anova import anova_lm
+import seaborn as sns
+import matplotlib.pyplot as plt
+import io
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
 
-# ----------------- App config -----------------
-st.set_page_config(page_title="Split plot analyser", page_icon="🧪", layout="wide")
-st.markdown("<h1 style='text-align:center'>🧪 Split plot analyser</h1>", unsafe_allow_html=True)
-st.markdown("<h4 style='text-align:center; color:gray'>Developed by Bhavya</h4>", unsafe_allow_html=True)
-st.write("---")
+# Configure page
+st.set_page_config(
+    page_title="Split Plot Analyzer",
+    page_icon="🧪",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# ----------------- Helper functions -----------------
+# Custom CSS for professional styling
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 3rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 0.5rem;
+    }
+    .sub-header {
+        font-size: 1.2rem;
+        color: #666;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .metric-container {
+        background: linear-gradient(90deg, #f0f2f6 0%, #ffffff 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        border-left: 4px solid #1f77b4;
+        margin: 1rem 0;
+    }
+    .success-box {
+        background-color: #d4edda;
+        border: 1px solid #c3e6cb;
+        border-radius: 5px;
+        padding: 1rem;
+        margin: 1rem 0;
+    }
+    .interpretation-box {
+        background-color: #f8f9fa;
+        border-left: 4px solid #28a745;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-radius: 0 5px 5px 0;
+    }
+    .significant {
+        color: #28a745;
+        font-weight: bold;
+    }
+    .not-significant {
+        color: #dc3545;
+        font-weight: bold;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-def read_with_two_headers(uploaded_file):
-    """
-    Reads uploaded CSV/Excel that uses two header rows:
-      header row 0: day (d1,d2,d3,...)
-      header row 1: replication (r1,r2,...)
-    Returns a DataFrame with merged column names ("d1_r1", ...)
-    """
-    suf = Path(uploaded_file.name).suffix.lower()
-    uploaded_file.seek(0)
+# Title and header
+st.markdown('<div class="main-header">🧪 Split Plot Analyzer</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Developed by Bhavya</div>', unsafe_allow_html=True)
+
+# Helper functions
+@st.cache_data
+def load_data(uploaded_file):
+    """Load data from various file formats"""
     try:
-        if suf in [".xls", ".xlsx"]:
-            df = pd.read_excel(uploaded_file, header=[0,1])
+        file_extension = Path(uploaded_file.name).suffix.lower()
+        
+        if file_extension == '.csv':
+            df = pd.read_csv(uploaded_file)
+        elif file_extension in ['.xlsx', '.xls']:
+            df = pd.read_excel(uploaded_file)
         else:
-            # try read with two header rows
-            df = pd.read_csv(uploaded_file, header=[0,1])
-    except Exception:
-        # fallback single header
-        uploaded_file.seek(0)
-        if suf in [".xls", ".xlsx"]:
-            df = pd.read_excel(uploaded_file, header=0)
-        else:
-            df = pd.read_csv(uploaded_file, header=0)
-    # Merge multiindex columns if present
-    if isinstance(df.columns, pd.MultiIndex):
-        new_cols = []
-        for tup in df.columns:
-            left = "" if pd.isna(tup[0]) else str(tup[0]).strip()
-            right = "" if pd.isna(tup[1]) else str(tup[1]).strip()
-            merged = f"{left}_{right}".strip("_")
-            new_cols.append(merged)
-        df.columns = new_cols
-    # Drop entirely empty rows/cols
-    df = df.dropna(how="all", axis=0).dropna(how="all", axis=1)
-    return df
-
-def tidy_and_transform(df):
-    """
-    - Ensures first column is Genotype (rename to 'Genotype')
-    - Drops a 'Mean' column if present
-    - Extracts data columns like 'd1_r1' and transforms to long format:
-       Genotype | Treatment (d1/d2/d3) | Replication (r1/r2) | Response
-    """
-    df = df.copy()
-    # Rename first column to Genotype
-    first_col = df.columns[0]
-    df = df.rename(columns={first_col: "Genotype"})
-    # Drop Mean-like columns
-    mean_cols = [c for c in df.columns if str(c).strip().lower().startswith("mean")]
-    if mean_cols:
-        df = df.drop(columns=mean_cols)
-    # Identify data columns
-    data_cols = [c for c in df.columns if c != "Genotype"]
-    records = []
-    for col in data_cols:
-        col_s = str(col).strip()
-        # Expecting patterns like 'd1_r1' after header merge
-        if "_" in col_s:
-            treatment, rep = col_s.split("_", 1)
-        else:
-            # fallback: if header is 'd1 r1' or 'd1r1', attempt to parse
-            if " " in col_s:
-                parts = col_s.split()
-                treatment = parts[0]
-                rep = parts[1] if len(parts) > 1 else "r1"
-            else:
-                # try to separate letters+digits and 'r' token
-                lower = col_s.lower()
-                if "r" in lower and any(ch.isdigit() for ch in lower):
-                    idx = lower.rfind("r")
-                    treatment = col_s[:idx]
-                    rep = col_s[idx:]
-                else:
-                    treatment = col_s
-                    rep = "r1"
-        tmp = df[["Genotype", col]].copy()
-        tmp.columns = ["Genotype", "Response"]
-        tmp["Treatment"] = treatment
-        tmp["Replication"] = rep
-        records.append(tmp)
-    long_df = pd.concat(records, ignore_index=True)
-    long_df["Response"] = pd.to_numeric(long_df["Response"], errors="coerce")
-    long_df = long_df.dropna(subset=["Response"]).reset_index(drop=True)
-    # Clean columns
-    long_df["Genotype"] = long_df["Genotype"].astype(str).str.strip()
-    long_df["Treatment"] = long_df["Treatment"].astype(str).str.strip()
-    long_df["Replication"] = long_df["Replication"].astype(str).str.strip().str.lower()
-    return long_df
-
-def compute_ols_anova(long_df, typ=2):
-    """
-    Fit OLS model Response ~ C(Genotype) * C(Treatment) and return model + anova table.
-    """
-    formula = "Response ~ C(Genotype) * C(Treatment)"
-    model = ols(formula, data=long_df).fit()
-    anova_res = anova_lm(model, typ=typ)
-    # add mean_sq for convenience
-    anova_res = anova_res.copy()
-    anova_res["mean_sq"] = anova_res["sum_sq"] / anova_res["df"]
-    return model, anova_res
-
-def fit_mixed_model(long_df):
-    """
-    Fit a simple mixed-effects model: Response ~ C(Treatment) with random intercept for Genotype.
-    This is a typical approach to capture whole-plot Genotype variance and use residuals for subplot errors.
-    """
-    try:
-        import statsmodels.formula.api as smf
-        md = smf.mixedlm("Response ~ C(Treatment)", long_df, groups=long_df["Genotype"])
-        mdf = md.fit(method="lbfgs")
-        return mdf
+            st.error("Unsupported file format. Please upload CSV, XLS, or XLSX files.")
+            return None
+        
+        return df
     except Exception as e:
+        st.error(f"Error loading file: {str(e)}")
         return None
 
-def pairwise_contrasts(long_df, anova_res, group_col="Treatment"):
-    """
-    Compute pairwise contrasts between levels of group_col using Residual MSE from OLS ANOVA.
-    Returns DataFrame with: contrast, estimate, SE, df, t.ratio, p.value, Significance
-    """
-    gm = long_df.groupby(group_col)["Response"].agg(["mean", "count"]).rename(columns={"mean":"mean", "count":"n"})
-    levels = list(gm.index)
-    # Residual row (last index usually)
-    # Prefer 'Residual' label, else take last row
-    if "Residual" in anova_res.index:
-        resid_row = anova_res.loc["Residual"]
-    elif "Residuals" in anova_res.index:
-        resid_row = anova_res.loc["Residuals"]
-    else:
-        resid_row = anova_res.iloc[-1]
-    mse = float(resid_row["mean_sq"])
-    df_resid = float(resid_row["df"])
-    records = []
-    for i in range(len(levels)):
-        for j in range(i+1, len(levels)):
-            A = levels[i]; B = levels[j]
-            meanA = gm.loc[A, "mean"]; meanB = gm.loc[B, "mean"]
-            nA = gm.loc[A, "n"]; nB = gm.loc[B, "n"]
-            est = meanA - meanB
-            se = np.sqrt(mse * (1.0/nA + 1.0/nB))
-            if se == 0 or np.isnan(se):
-                t_ratio = np.nan; pval = np.nan
+def detect_split_plot_structure(df):
+    """Detect if data follows genotype-treatment structure"""
+    try:
+        # Check if first column contains genotypes
+        first_col = df.columns[0].lower()
+        if 'genotype' in first_col or 'variety' in first_col or df.iloc[:, 0].astype(str).str.startswith('g').any():
+            return True
+        return False
+    except:
+        return False
+
+def transform_genotype_data(df):
+    """Transform genotype-treatment data to long format"""
+    try:
+        # Get the genotype column (first column)
+        genotype_col = df.columns[0]
+        genotypes = df[genotype_col].dropna()
+        
+        # Get treatment columns (excluding genotype column)
+        treatment_cols = [col for col in df.columns if col != genotype_col]
+        
+        # Parse treatment structure (d1_r1, d1_r2, etc.)
+        long_data = []
+        
+        for idx, genotype in enumerate(genotypes):
+            for col in treatment_cols:
+                if pd.notna(df.iloc[idx][col]) and df.iloc[idx][col] != '':
+                    # Parse treatment and replication
+                    if '_' in col or 'r' in col:
+                        # Handle formats like "d1_r1" or column headers with treatments
+                        parts = col.split('_') if '_' in col else [col]
+                        treatment = parts[0] if parts else col
+                        replication = parts[1] if len(parts) > 1 else 'r1'
+                    else:
+                        treatment = col
+                        replication = 'r1'
+                    
+                    long_data.append({
+                        'Genotype': genotype,
+                        'Treatment': treatment,
+                        'Replication': replication,
+                        'Response': df.iloc[idx][col]
+                    })
+        
+        df_long = pd.DataFrame(long_data)
+        
+        # Clean and convert response to numeric
+        df_long['Response'] = pd.to_numeric(df_long['Response'], errors='coerce')
+        df_long = df_long.dropna(subset=['Response'])
+        
+        return df_long
+        
+    except Exception as e:
+        st.error(f"Error in data transformation: {str(e)}")
+        return None
+
+def auto_transform_wide_data(df):
+    """Automatically transform wide format data based on column structure"""
+    try:
+        # Identify potential genotype/main plot column (first column with text data)
+        main_plot_col = df.columns[0]
+        
+        # Get all other columns as potential treatments
+        treatment_cols = df.columns[1:].tolist()
+        
+        # Create long format
+        df_melted = df.melt(id_vars=[main_plot_col], 
+                           value_vars=treatment_cols,
+                           var_name='Treatment', 
+                           value_name='Response')
+        
+        # Parse treatment structure to extract treatment and replication
+        df_melted['Treatment_Clean'] = df_melted['Treatment'].str.extract(r'([a-zA-Z]+\d+)', expand=False)
+        df_melted['Replication'] = df_melted['Treatment'].str.extract(r'([rR]\d+)', expand=False)
+        
+        # Fill missing replications
+        df_melted['Replication'] = df_melted['Replication'].fillna('r1')
+        df_melted['Treatment_Clean'] = df_melted['Treatment_Clean'].fillna(df_melted['Treatment'])
+        
+        # Rename columns
+        df_melted = df_melted.rename(columns={
+            main_plot_col: 'Genotype',
+            'Treatment_Clean': 'Treatment'
+        })
+        
+        # Convert response to numeric
+        df_melted['Response'] = pd.to_numeric(df_melted['Response'], errors='coerce')
+        df_melted = df_melted.dropna(subset=['Response'])
+        
+        return df_melted[['Genotype', 'Treatment', 'Replication', 'Response']]
+        
+    except Exception as e:
+        st.error(f"Error in automatic transformation: {str(e)}")
+        return None
+
+def perform_split_plot_anova(df):
+    """Perform Split Plot ANOVA Analysis"""
+    try:
+        # Create the model formula for split plot design
+        # Genotype = Main plot factor, Treatment = Subplot factor
+        formula = "Response ~ C(Genotype) * C(Treatment)"
+        
+        # Fit the model
+        model = ols(formula, data=df).fit()
+        
+        # Perform ANOVA
+        anova_results = anova_lm(model, typ=2)
+        
+        return model, anova_results
+    except Exception as e:
+        st.error(f"Error in ANOVA analysis: {str(e)}")
+        return None, None
+
+def perform_tukey_hsd(df, factor_col, response_col):
+    """Perform Tukey HSD post-hoc test"""
+    try:
+        tukey_results = pairwise_tukeyhsd(endog=df[response_col], 
+                                        groups=df[factor_col], 
+                                        alpha=0.05)
+        return tukey_results
+    except Exception as e:
+        st.error(f"Error in Tukey HSD test: {str(e)}")
+        return None
+
+def create_comprehensive_plots(df):
+    """Create comprehensive visualization suite"""
+    plots = {}
+    
+    try:
+        # 1. Main effects plot - Genotype
+        genotype_means = df.groupby('Genotype')['Response'].agg(['mean', 'std', 'count']).reset_index()
+        genotype_means['se'] = genotype_means['std'] / np.sqrt(genotype_means['count'])
+        
+        fig1 = px.bar(genotype_means, x='Genotype', y='mean', 
+                      error_y='se',
+                      title='Main Effect: Genotype Performance',
+                      labels={'mean': 'Mean Response', 'Genotype': 'Genotype'})
+        fig1.update_layout(showlegend=False, height=400)
+        plots['genotype_main'] = fig1
+        
+        # 2. Main effects plot - Treatment
+        treatment_means = df.groupby('Treatment')['Response'].agg(['mean', 'std', 'count']).reset_index()
+        treatment_means['se'] = treatment_means['std'] / np.sqrt(treatment_means['count'])
+        
+        fig2 = px.bar(treatment_means, x='Treatment', y='mean', 
+                      error_y='se',
+                      title='Main Effect: Treatment Performance',
+                      labels={'mean': 'Mean Response', 'Treatment': 'Treatment'},
+                      color='Treatment')
+        fig2.update_layout(showlegend=False, height=400)
+        plots['treatment_main'] = fig2
+        
+        # 3. Interaction plot
+        interaction_means = df.groupby(['Genotype', 'Treatment'])['Response'].mean().reset_index()
+        fig3 = px.line(interaction_means, x='Treatment', y='Response', color='Genotype',
+                      title='Genotype × Treatment Interaction',
+                      markers=True)
+        fig3.update_layout(height=500)
+        plots['interaction'] = fig3
+        
+        # 4. Heatmap of means
+        pivot_data = df.groupby(['Genotype', 'Treatment'])['Response'].mean().unstack()
+        fig4 = px.imshow(pivot_data.values, 
+                        x=pivot_data.columns, 
+                        y=pivot_data.index,
+                        aspect='auto',
+                        title='Response Heatmap: Genotype × Treatment',
+                        color_continuous_scale='viridis')
+        fig4.update_xaxes(title='Treatment')
+        fig4.update_yaxes(title='Genotype')
+        plots['heatmap'] = fig4
+        
+        # 5. Box plots for variability assessment
+        fig5 = px.box(df, x='Genotype', y='Response', color='Treatment',
+                     title='Response Distribution by Genotype and Treatment')
+        fig5.update_layout(height=500)
+        plots['boxplot'] = fig5
+        
+        # 6. Violin plots for distribution shape
+        fig6 = px.violin(df, x='Treatment', y='Response', color='Treatment',
+                        title='Response Distribution Shape by Treatment')
+        fig6.update_layout(showlegend=False, height=400)
+        plots['violin'] = fig6
+        
+        return plots
+        
+    except Exception as e:
+        st.error(f"Error creating plots: {str(e)}")
+        return {}
+
+def interpret_results(anova_results, tukey_genotype, tukey_treatment, df):
+    """Provide comprehensive interpretation of results"""
+    interpretations = []
+    
+    try:
+        # ANOVA interpretation
+        alpha = 0.05
+        
+        if 'PR(>F)' in anova_results.columns:
+            # Genotype effect
+            genotype_p = anova_results.loc['C(Genotype)', 'PR(>F)']
+            if genotype_p < alpha:
+                interpretations.append(f"🔍 **Genotype Effect**: Highly significant (p = {genotype_p:.6f})")
+                interpretations.append("   → Different genotypes show significantly different responses")
             else:
-                t_ratio = est / se
-                pval = 2.0 * (1 - tdist.cdf(abs(t_ratio), df_resid))
-            sig = "***" if (not pd.isna(pval) and pval < 0.001) else "**" if (not pd.isna(pval) and pval < 0.01) else "*" if (not pd.isna(pval) and pval < 0.05) else "ns"
-            records.append({
-                "contrast": f"{A} - {B}",
-                "estimate": round(est, 6),
-                "SE": round(se, 8),
-                "df": int(df_resid) if not pd.isna(df_resid) else None,
-                "t.ratio": round(t_ratio, 6) if not pd.isna(t_ratio) else np.nan,
-                "p.value": round(pval, 9) if not pd.isna(pval) else np.nan,
-                "Significance": sig
-            })
-    posthoc_df = pd.DataFrame(records).sort_values("p.value").reset_index(drop=True)
-    return posthoc_df
+                interpretations.append(f"🔍 **Genotype Effect**: Not significant (p = {genotype_p:.6f})")
+                interpretations.append("   → No significant differences between genotypes")
+            
+            # Treatment effect
+            treatment_p = anova_results.loc['C(Treatment)', 'PR(>F)']
+            if treatment_p < alpha:
+                interpretations.append(f"🔍 **Treatment Effect**: Significant (p = {treatment_p:.6f})")
+                interpretations.append("   → Different treatments show significantly different effects")
+            else:
+                interpretations.append(f"🔍 **Treatment Effect**: Not significant (p = {treatment_p:.6f})")
+                interpretations.append("   → No significant differences between treatments")
+            
+            # Interaction effect
+            if 'C(Genotype):C(Treatment)' in anova_results.index:
+                interaction_p = anova_results.loc['C(Genotype):C(Treatment)', 'PR(>F)']
+                if interaction_p < alpha:
+                    interpretations.append(f"🔍 **Interaction Effect**: Significant (p = {interaction_p:.6f})")
+                    interpretations.append("   → The effect of treatment depends on genotype (or vice versa)")
+                    interpretations.append("   → Simple effects analysis recommended")
+                else:
+                    interpretations.append(f"🔍 **Interaction Effect**: Not significant (p = {interaction_p:.6f})")
+                    interpretations.append("   → Treatment effects are consistent across genotypes")
+        
+        # Best performing combinations
+        best_combo = df.groupby(['Genotype', 'Treatment'])['Response'].mean().idxmax()
+        best_mean = df.groupby(['Genotype', 'Treatment'])['Response'].mean().max()
+        interpretations.append(f"🏆 **Best Combination**: {best_combo[0]} with {best_combo[1]} (Mean: {best_mean:.2f})")
+        
+        # Worst performing combination
+        worst_combo = df.groupby(['Genotype', 'Treatment'])['Response'].mean().idxmin()
+        worst_mean = df.groupby(['Genotype', 'Treatment'])['Response'].mean().min()
+        interpretations.append(f"⚠️ **Poorest Combination**: {worst_combo[0]} with {worst_combo[1]} (Mean: {worst_mean:.2f})")
+        
+        # Performance range
+        overall_range = best_mean - worst_mean
+        interpretations.append(f"📊 **Performance Range**: {overall_range:.2f} units difference between best and worst")
+        
+        return interpretations
+        
+    except Exception as e:
+        st.error(f"Error in interpretation: {str(e)}")
+        return ["Error generating interpretations"]
 
-def format_anova_display(anova_res):
-    df = anova_res.copy()
-    disp = df[["sum_sq","df","mean_sq","F","PR(>F)"]].rename(columns={"sum_sq":"Sum Sq","mean_sq":"Mean Sq","PR(>F)":"p-value"})
-    return disp.round(6)
+def create_summary_table(df):
+    """Create comprehensive summary statistics"""
+    try:
+        # Overall summary
+        overall_stats = df.groupby(['Genotype', 'Treatment'])['Response'].agg([
+            'count', 'mean', 'std', 'min', 'max', 'median'
+        ]).round(3)
+        
+        # Add coefficient of variation
+        overall_stats['CV%'] = ((overall_stats['std'] / overall_stats['mean']) * 100).round(2)
+        
+        # Add ranking
+        overall_stats['Rank'] = overall_stats['mean'].rank(ascending=False, method='min')
+        
+        return overall_stats.reset_index()
+        
+    except Exception as e:
+        st.error(f"Error creating summary table: {str(e)}")
+        return None
 
-def to_csv_bytes(df):
-    buff = StringIO()
-    df.to_csv(buff, index=False)
-    return buff.getvalue().encode("utf-8")
+# Main application
+def main():
+    # Sidebar for data upload
+    with st.sidebar:
+        st.header("📁 Data Upload")
+        uploaded_file = st.file_uploader(
+            "Choose your data file",
+            type=['csv', 'xlsx', 'xls'],
+            help="Upload CSV, XLS, or XLSX files with genotype-treatment structure"
+        )
+        
+        if uploaded_file is not None:
+            st.success(f"✅ File uploaded: {uploaded_file.name}")
+            
+            # Load data
+            df_raw = load_data(uploaded_file)
+            
+            if df_raw is not None:
+                st.markdown("### 📊 Raw Data Preview")
+                st.dataframe(df_raw.head(10), use_container_width=True)
+                st.markdown(f"**Shape:** {df_raw.shape[0]} rows × {df_raw.shape[1]} columns")
+                
+                # Auto-transform data
+                if st.button("🔄 Transform to Long Format", type="primary"):
+                    with st.spinner("Transforming data..."):
+                        # Try genotype-specific transformation first
+                        if detect_split_plot_structure(df_raw):
+                            df_transformed = transform_genotype_data(df_raw)
+                        else:
+                            df_transformed = auto_transform_wide_data(df_raw)
+                        
+                        if df_transformed is not None and len(df_transformed) > 0:
+                            st.success("✅ Data transformed successfully!")
+                            st.session_state['df_analysis'] = df_transformed
+                            
+                            st.markdown("### 📈 Transformed Data Preview")
+                            st.dataframe(df_transformed.head(), use_container_width=True)
+                            st.markdown(f"**Transformed Shape:** {df_transformed.shape[0]} rows × {df_transformed.shape[1]} columns")
+                            
+                            # Data validation
+                            n_genotypes = df_transformed['Genotype'].nunique()
+                            n_treatments = df_transformed['Treatment'].nunique()
+                            n_observations = len(df_transformed)
+                            
+                            st.markdown("### 📋 Design Summary")
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Genotypes", n_genotypes)
+                            with col2:
+                                st.metric("Treatments", n_treatments)
+                            with col3:
+                                st.metric("Total Obs.", n_observations)
+                        else:
+                            st.error("❌ Failed to transform data. Please check your data format.")
 
-def generate_report_text(long_df, anova_res, posthoc_df):
-    n_geno = long_df["Genotype"].nunique()
-    n_treat = long_df["Treatment"].nunique()
-    total_obs = len(long_df)
-    best_pair = long_df.groupby(["Genotype","Treatment"])["Response"].mean().idxmax()
-    best_mean = long_df.groupby(["Genotype","Treatment"])["Response"].mean().max()
-    text = dedent(f"""
-    Split plot analyser — Report
-    Developed by Bhavya
+    # Main content area
+    if uploaded_file is None:
+        st.info("👆 Please upload a data file to begin analysis")
+        
+        # Show expected data format
+        st.markdown("### 📋 Expected Data Format")
+        
+        st.markdown("**Your data should have genotypes as rows and treatments as columns:**")
+        
+        # Create example data matching the user's format
+        example_data = pd.DataFrame({
+            'Genotypes': [f'g{i}' for i in range(1, 8)],
+            'd1_r1': [23.5, 21.2, 25.8, 22.1, 24.5, 20.9, 23.2],
+            'd1_r2': [24.1, 22.0, 26.2, 22.8, 25.1, 21.5, 23.8],
+            'd2_r1': [21.3, 19.8, 23.5, 20.2, 22.1, 18.9, 21.0],
+            'd2_r2': [22.0, 20.5, 24.1, 21.0, 22.8, 19.6, 21.7],
+            'd3_r1': [19.8, 18.2, 21.5, 18.5, 20.2, 17.1, 19.3],
+            'd3_r2': [20.5, 19.0, 22.2, 19.2, 20.9, 17.8, 20.0]
+        })
+        
+        st.dataframe(example_data, use_container_width=True)
+        
+        st.markdown("""
+        **Where:**
+        - **Genotypes**: Your genotype/variety names (g1, g2, etc.)
+        - **d1, d2, d3**: Different treatments/doses
+        - **r1, r2**: Replications for each treatment
+        """)
+    
+    elif 'df_analysis' in st.session_state:
+        df_analysis = st.session_state['df_analysis']
+        
+        # Main analysis
+        st.header("📈 Split Plot Analysis Results")
+        
+        # Summary statistics
+        with st.expander("📊 Comprehensive Summary Statistics", expanded=True):
+            summary_table = create_summary_table(df_analysis)
+            if summary_table is not None:
+                st.dataframe(summary_table, use_container_width=True)
+                
+                # Quick insights
+                best_performer = summary_table.loc[summary_table['mean'].idxmax()]
+                st.markdown(f"""
+                <div class="interpretation-box">
+                <h4>🏆 Top Performer</h4>
+                <strong>{best_performer['Genotype']} with {best_performer['Treatment']}</strong><br>
+                Mean Response: {best_performer['mean']:.3f} ± {best_performer['std']:.3f}<br>
+                Rank: #{int(best_performer['Rank'])} out of {len(summary_table)}
+                </div>
+                """, unsafe_allow_html=True)
+        
+        # ANOVA Analysis
+        with st.expander("🔬 Split Plot ANOVA", expanded=True):
+            model, anova_results = perform_split_plot_anova(df_analysis)
+            
+            if anova_results is not None:
+                st.subheader("ANOVA Table")
+                
+                # Format ANOVA results
+                anova_formatted = anova_results.copy()
+                anova_formatted['Significance'] = anova_formatted['PR(>F)'].apply(
+                    lambda x: '***' if x < 0.001 else '**' if x < 0.01 else '*' if x < 0.05 else 'ns' if pd.notna(x) else ''
+                )
+                
+                # Round for display
+                for col in ['sum_sq', 'mean_sq', 'F', 'PR(>F)']:
+                    if col in anova_formatted.columns:
+                        anova_formatted[col] = anova_formatted[col].round(6)
+                
+                st.dataframe(anova_formatted, use_container_width=True)
+                
+                # Legend
+                st.markdown("**Significance levels:** *** p<0.001, ** p<0.01, * p<0.05, ns = not significant")
+        
+        # Post-hoc Analysis
+        with st.expander("🎯 Post-hoc Analysis (Tukey HSD)", expanded=True):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("Genotype Comparisons")
+                tukey_genotype = perform_tukey_hsd(df_analysis, 'Genotype', 'Response')
+                if tukey_genotype is not None:
+                    # Convert to DataFrame for better display
+                    tukey_df = pd.DataFrame(tukey_genotype.summary().data[1:], 
+                                          columns=tukey_genotype.summary().data[0])
+                    st.dataframe(tukey_df, use_container_width=True)
+            
+            with col2:
+                st.subheader("Treatment Comparisons")
+                tukey_treatment = perform_tukey_hsd(df_analysis, 'Treatment', 'Response')
+                if tukey_treatment is not None:
+                    tukey_df2 = pd.DataFrame(tukey_treatment.summary().data[1:], 
+                                           columns=tukey_treatment.summary().data[0])
+                    st.dataframe(tukey_df2, use_container_width=True)
+        
+        # Comprehensive Visualizations
+        st.header("📊 Comprehensive Visualizations")
+        
+        plots = create_comprehensive_plots(df_analysis)
+        
+        if plots:
+            # Main effects
+            col1, col2 = st.columns(2)
+            with col1:
+                if 'genotype_main' in plots:
+                    st.plotly_chart(plots['genotype_main'], use_container_width=True)
+            with col2:
+                if 'treatment_main' in plots:
+                    st.plotly_chart(plots['treatment_main'], use_container_width=True)
+            
+            # Interaction and heatmap
+            col1, col2 = st.columns(2)
+            with col1:
+                if 'interaction' in plots:
+                    st.plotly_chart(plots['interaction'], use_container_width=True)
+            with col2:
+                if 'heatmap' in plots:
+                    st.plotly_chart(plots['heatmap'], use_container_width=True)
+            
+            # Distribution analysis
+            if 'boxplot' in plots:
+                st.plotly_chart(plots['boxplot'], use_container_width=True)
+            
+            if 'violin' in plots:
+                st.plotly_chart(plots['violin'], use_container_width=True)
+        
+        # Interpretation
+        with st.expander("🔍 Statistical Interpretation & Recommendations", expanded=True):
+            if anova_results is not None:
+                interpretations = interpret_results(
+                    anova_results, 
+                    tukey_genotype if 'tukey_genotype' in locals() else None,
+                    tukey_treatment if 'tukey_treatment' in locals() else None,
+                    df_analysis
+                )
+                
+                for interpretation in interpretations:
+                    st.markdown(interpretation)
+                
+                # Recommendations
+                st.markdown("### 💡 Recommendations")
+                
+                # Check for significant effects and provide recommendations
+                if 'PR(>F)' in anova_results.columns:
+                    genotype_p = anova_results.loc['C(Genotype)', 'PR(>F)']
+                    treatment_p = anova_results.loc['C(Treatment)', 'PR(>F)']
+                    
+                    if genotype_p < 0.05:
+                        best_genotype = df_analysis.groupby('Genotype')['Response'].mean().idxmax()
+                        st.success(f"✅ **Genotype Selection**: Choose **{best_genotype}** for best performance")
+                    
+                    if treatment_p < 0.05:
+                        best_treatment = df_analysis.groupby('Treatment')['Response'].mean().idxmax()
+                        st.success(f"✅ **Treatment Selection**: Use **{best_treatment}** for optimal results")
+                    
+                    # Interaction recommendations
+                    if 'C(Genotype):C(Treatment)' in anova_results.index:
+                        interaction_p = anova_results.loc['C(Genotype):C(Treatment)', 'PR(>F)']
+                        if interaction_p < 0.05:
+                            st.warning("⚠️ **Important**: Significant interaction detected! Treatment effectiveness varies by genotype. Consider genotype-specific treatment recommendations.")
+        
+        # Model Diagnostics
+        with st.expander("🔍 Model Diagnostics", expanded=False):
+            if model is not None:
+                residuals = model.resid
+                fitted = model.fittedvalues
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Residuals vs Fitted
+                    fig_resid = go.Figure()
+                    fig_resid.add_trace(go.Scatter(x=fitted, y=residuals, mode='markers',
+                                                 name='Residuals', opacity=0.7))
+                    fig_resid.add_hline(y=0, line_dash="dash", line_color="red")
+                    fig_resid.update_layout(title="Residuals vs Fitted Values",
+                                          xaxis_title="Fitted Values",
+                                          yaxis_title="Residuals",
+                                          height=400)
+                    st.plotly_chart(fig_resid, use_container_width=True)
+                
+                with col2:
+                    # Q-Q plot
+                    from scipy.stats import probplot
+                    qq = probplot(residuals, dist="norm")
+                    
+                    fig_qq = go.Figure()
+                    fig_qq.add_trace(go.Scatter(x=qq[0][0], y=qq[0][1], mode='markers',
+                                              name='Sample Quantiles', opacity=0.7))
+                    fig_qq.add_trace(go.Scatter(x=qq[0][0], y=qq[1][1] + qq[1][0]*qq[0][0],
+                                              mode='lines', name='Theoretical Line',
+                                              line=dict(color='red', dash='dash')))
+                    fig_qq.update_layout(title="Normal Q-Q Plot",
+                                       xaxis_title="Theoretical Quantiles",
+                                       yaxis_title="Sample Quantiles",
+                                       height=400)
+                    st.plotly_chart(fig_qq, use_container_width=True)
+                
+                # Model assumptions check
+                st.markdown("### Model Assumptions Assessment")
+                
+                # Shapiro-Wilk test for normality
+                shapiro_stat, shapiro_p = stats.shapiro(residuals)
+                if shapiro_p > 0.05:
+                    st.success(f"✅ **Normality**: Residuals appear normally distributed (Shapiro-Wilk p = {shapiro_p:.4f})")
+                else:
+                    st.warning(f"⚠️ **Normality**: Residuals may not be normally distributed (Shapiro-Wilk p = {shapiro_p:.4f})")
+                
+                # Levene's test for homogeneity of variance
+                groups = [group['Response'].values for name, group in df_analysis.groupby(['Genotype', 'Treatment'])]
+                if len(groups) > 1:
+                    levene_stat, levene_p = stats.levene(*groups)
+                    if levene_p > 0.05:
+                        st.success(f"✅ **Homogeneity**: Equal variances assumption satisfied (Levene's p = {levene_p:.4f})")
+                    else:
+                        st.warning(f"⚠️ **Homogeneity**: Unequal variances detected (Levene's p = {levene_p:.4f})")
+        
+        # Export functionality
+        st.header("💾 Export Results")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("📊 Download Summary Data", type="primary"):
+                summary_csv = create_summary_table(df_analysis).to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Summary CSV",
+                    data=summary_csv,
+                    file_name=f"split_plot_summary_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+        
+        with col2:
+            if st.button("📄 Generate Full Report", type="primary"):
+                # Create comprehensive report
+                report_content = generate_comprehensive_report(df_analysis, anova_results, summary_table)
+                st.download_button(
+                    label="📥 Download Full Report",
+                    data=report_content,
+                    file_name=f"split_plot_analysis_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain"
+                )
 
-    Design summary:
-    - Genotypes (main plots): {n_geno}
-    - Days (treatments, subplots): {n_treat}
-    - Total observations: {total_obs}
+def generate_comprehensive_report(df, anova_results, summary_table):
+    """Generate a comprehensive analysis report"""
+    try:
+        # Calculate key statistics
+        n_genotypes = df['Genotype'].nunique()
+        n_treatments = df['Treatment'].nunique()
+        n_observations = len(df)
+        overall_mean = df['Response'].mean()
+        overall_std = df['Response'].std()
+        
+        # Best and worst performers
+        best_combo = df.groupby(['Genotype', 'Treatment'])['Response'].mean().idxmax()
+        best_mean = df.groupby(['Genotype', 'Treatment'])['Response'].mean().max()
+        worst_combo = df.groupby(['Genotype', 'Treatment'])['Response'].mean().idxmin()
+        worst_mean = df.groupby(['Genotype', 'Treatment'])['Response'].mean().min()
+        
+        # Generate report
+        report = f"""
+# SPLIT PLOT ANALYSIS REPORT
+## Developed by Bhavya
+### Generated on: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-    ANOVA (key table):
-    {anova_res.round(6).to_string()}
+===============================================================================
 
-    Best combination: {best_pair[0]} × {best_pair[1]} (Mean = {best_mean:.3f})
+## EXPERIMENTAL DESIGN SUMMARY
+- Design Type: Split Plot Design
+- Main Plot Factor: Genotype ({n_genotypes} levels)
+- Subplot Factor: Treatment ({n_treatments} levels)
+- Total Observations: {n_observations}
+- Overall Mean Response: {overall_mean:.3f} ± {overall_std:.3f}
 
-    Top post-hoc contrasts:
-    {posthoc_df.head(10).to_string(index=False)}
+## GENOTYPE LEVELS
+{', '.join(sorted(df['Genotype'].unique()))}
 
-    Notes:
-    - For formal split-plot inference prefer mixed-effects estimation for correct error partitioning.
-    - This app fits both OLS ANOVA and an optional mixed model (random intercept Genotype).
-    """)
-    return text
+## TREATMENT LEVELS
+{', '.join(sorted(df['Treatment'].unique()))}
 
-# ----------------- Sidebar: Upload & Options -----------------
-st.sidebar.header("Upload & Options")
-uploaded = st.sidebar.file_uploader("Upload CSV / XLS / XLSX (two header rows)", type=["csv","xls","xlsx"])
-anova_type = st.sidebar.selectbox("ANOVA type", ["Type II","Type III"], index=0,
-                                  help="Type II common for balanced; Type III for unbalanced or when interactions present.")
-fit_mixed = st.sidebar.checkbox("Fit Mixed-Effects model (random intercept for Genotype)", value=True)
-export_report = st.sidebar.checkbox("Enable downloadable report", value=True)
+===============================================================================
 
-if uploaded is None:
-    st.info("Upload your dataset (CSV/XLS/XLSX). The file should have two header rows: top row days (d1,d2,d3), second row replications (r1,r2). The left-most column should be genotype labels (g1...). A 'Mean' column (if present) will be ignored.")
-    st.stop()
+## ANALYSIS OF VARIANCE (ANOVA) RESULTS
 
-# ----------------- Read & Transform -----------------
-try:
-    raw_df = read_with_two_headers(uploaded)
-except Exception as e:
-    st.error(f"Error reading file: {e}")
-    st.stop()
+{anova_results.round(6).to_string()}
 
-st.subheader("Raw data (preview)")
-st.dataframe(raw_df.head(8), use_container_width=True)
+## SIGNIFICANCE INTERPRETATION
+"""
+        
+        # Add significance interpretation
+        if 'PR(>F)' in anova_results.columns:
+            alpha = 0.05
+            
+            # Genotype effect
+            genotype_p = anova_results.loc['C(Genotype)', 'PR(>F)']
+            genotype_status = "SIGNIFICANT" if genotype_p < alpha else "NOT SIGNIFICANT"
+            report += f"- Genotype Effect: {genotype_status} (p = {genotype_p:.6f})\n"
+            
+            # Treatment effect
+            treatment_p = anova_results.loc['C(Treatment)', 'PR(>F)']
+            treatment_status = "SIGNIFICANT" if treatment_p < alpha else "NOT SIGNIFICANT"
+            report += f"- Treatment Effect: {treatment_status} (p = {treatment_p:.6f})\n"
+            
+            # Interaction effect
+            if 'C(Genotype):C(Treatment)' in anova_results.index:
+                interaction_p = anova_results.loc['C(Genotype):C(Treatment)', 'PR(>F)']
+                interaction_status = "SIGNIFICANT" if interaction_p < alpha else "NOT SIGNIFICANT"
+                report += f"- Genotype × Treatment Interaction: {interaction_status} (p = {interaction_p:.6f})\n"
+        
+        report += f"""
+===============================================================================
 
-# Transform
-long_df = tidy_and_transform(raw_df)
-if long_df.empty:
-    st.error("No numeric Response values found after transformation. Check file format.")
-    st.stop()
+## PERFORMANCE SUMMARY
 
-st.subheader("Long format data (preview)")
-st.dataframe(long_df.head(12), use_container_width=True)
-st.markdown(f"**Observations:** {len(long_df)}  •  **Genotypes:** {long_df['Genotype'].nunique()}  •  **Days (Treatments):** {long_df['Treatment'].nunique()}")
+### BEST PERFORMING COMBINATION
+- Genotype: {best_combo[0]}
+- Treatment: {best_combo[1]}
+- Mean Response: {best_mean:.3f}
 
-# ----------------- ANOVA -----------------
-st.write("---")
-st.header("ANOVA (Genotype × Day)")
+### POOREST PERFORMING COMBINATION
+- Genotype: {worst_combo[0]}
+- Treatment: {worst_combo[1]}
+- Mean Response: {worst_mean:.3f}
 
-typ = 2 if anova_type == "Type II" else 3
-ols_model, anova_res = compute_ols_anova(long_df, typ=typ)
+### PERFORMANCE RANGE
+- Difference between best and worst: {(best_mean - worst_mean):.3f} units
+- Relative improvement: {((best_mean - worst_mean) / worst_mean * 100):.1f}%
 
-st.subheader("OLS ANOVA table")
-st.dataframe(format_anova_display(anova_res), use_container_width=True)
+===============================================================================
 
-# Interaction message
-interaction_label = f"C(Genotype):C(Treatment)"
-if interaction_label in anova_res.index:
-    p_int = anova_res.loc[interaction_label, "PR(>F)"]
-    if p_int < 0.05:
-        st.warning(f"Significant Genotype × Treatment interaction (p = {p_int:.4g}). Interpret main effects with caution.")
-    else:
-        st.success(f"No significant Genotype × Treatment interaction (p = {p_int:.4g}).")
+## DETAILED SUMMARY STATISTICS
 
-# ----------------- Mixed Model (Split-plot) -----------------
-if fit_mixed:
-    st.write("---")
-    st.header("Mixed-effects model (recommended for split-plot inference)")
-    mdf = fit_mixed_model(long_df)
-    if mdf is None:
-        st.error("Mixed model could not be fit. This can happen if data lack variability or model convergence fails.")
-    else:
-        st.text("Mixed model summary (random intercept for Genotype):")
-        st.text(mdf.summary().as_text())
+"""
+        
+        # Add summary table
+        if summary_table is not None:
+            report += summary_table.to_string(index=False)
+        
+        report += f"""
 
-# ----------------- Post-hoc contrasts -----------------
-st.write("---")
-st.header("Post-hoc pairwise contrasts (Days) — contrasts computed using OLS residual MSE")
+===============================================================================
 
-posthoc_df = pairwise_contrasts(long_df, anova_res, group_col="Treatment")
-# display in requested format (rounded)
-st.dataframe(posthoc_df, use_container_width=True)
+## RECOMMENDATIONS
 
-# Additionally show Tukey HSD (statsmodels) for the Treatment factor (p-adj)
-try:
-    tuk = pairwise_tukeyhsd(endog=long_df["Response"], groups=long_df["Treatment"], alpha=0.05)
-    tuk_df = pd.DataFrame(tuk.summary().data[1:], columns=tuk.summary().data[0])
-    st.subheader("Tukey HSD (adjusted p-values) — Treatments")
-    st.dataframe(tuk_df, use_container_width=True)
-except Exception:
-    st.info("Tukey HSD (statsmodels) could not be computed for Treatments on this dataset (insufficient or unbalanced data).")
+### GENOTYPE SELECTION"""
+        
+        # Genotype recommendations
+        genotype_means = df.groupby('Genotype')['Response'].mean().sort_values(ascending=False)
+        top_3_genotypes = genotype_means.head(3)
+        
+        report += f"""
+Top 3 performing genotypes:
+"""
+        for i, (genotype, mean_val) in enumerate(top_3_genotypes.items(), 1):
+            report += f"{i}. {genotype}: {mean_val:.3f}\n"
+        
+        report += f"""
+### TREATMENT SELECTION"""
+        
+        # Treatment recommendations
+        treatment_means = df.groupby('Treatment')['Response'].mean().sort_values(ascending=False)
+        
+        report += f"""
+Treatment ranking (best to worst):
+"""
+        for i, (treatment, mean_val) in enumerate(treatment_means.items(), 1):
+            report += f"{i}. {treatment}: {mean_val:.3f}\n"
+        
+        # Interaction-based recommendations
+        if 'PR(>F)' in anova_results.columns and 'C(Genotype):C(Treatment)' in anova_results.index:
+            interaction_p = anova_results.loc['C(Genotype):C(Treatment)', 'PR(>F)']
+            if interaction_p < 0.05:
+                report += f"""
+### INTERACTION CONSIDERATIONS
+⚠️  IMPORTANT: Significant genotype × treatment interaction detected!
+   This means treatment effectiveness varies by genotype.
+   
+   Genotype-specific recommendations:
+"""
+                # Get best treatment for each genotype
+                for genotype in df['Genotype'].unique():
+                    genotype_data = df[df['Genotype'] == genotype]
+                    best_treatment = genotype_data.groupby('Treatment')['Response'].mean().idxmax()
+                    best_response = genotype_data.groupby('Treatment')['Response'].mean().max()
+                    report += f"   - {genotype}: Use {best_treatment} (Mean: {best_response:.3f})\n"
+        
+        report += f"""
 
-# ----------------- Visualizations -----------------
-st.write("---")
-st.header("Publication-quality visualizations")
+===============================================================================
 
-PLOTLY_LAYOUT = dict(template="plotly_white", font=dict(family="Arial", size=13), legend=dict(orientation="h"))
+## STATISTICAL ASSUMPTIONS
 
-# 1) Treatment (day) means with 95% CI (Mean ± 1.96*SE)
-tstats = long_df.groupby("Treatment")["Response"].agg(["mean","std","count"]).reset_index()
-tstats["se"] = tstats["std"] / np.sqrt(tstats["count"])
-tstats["ci_lower"] = tstats["mean"] - 1.96*tstats["se"]
-tstats["ci_upper"] = tstats["mean"] + 1.96*tstats["se"]
-fig_t = go.Figure()
-fig_t.add_trace(go.Bar(x=tstats["Treatment"], y=tstats["mean"], marker=dict(color="rgb(31,119,180)"),
-                       error_y=dict(type="data", array=tstats["se"], visible=True), name="Mean ± SE"))
-fig_t.update_layout(title="Day (Treatment) means — Mean ± SE", xaxis_title="Day", yaxis_title="Response", **PLOTLY_LAYOUT)
-st.plotly_chart(fig_t, use_container_width=True)
+### MODEL VALIDATION
+- Split plot ANOVA assumes:
+  1. Normality of residuals
+  2. Homogeneity of variances
+  3. Independence of observations
+  4. Additivity of effects
 
-# 2) Genotype means (for reference)
-gstats = long_df.groupby("Genotype")["Response"].agg(["mean","std","count"]).reset_index()
-gstats["se"] = gstats["std"] / np.sqrt(gstats["count"])
-fig_g = go.Figure()
-fig_g.add_trace(go.Bar(x=gstats["Genotype"], y=gstats["mean"], marker=dict(color="rgb(44,160,44)"),
-                       error_y=dict(type="data", array=gstats["se"], visible=True)))
-fig_g.update_layout(title="Genotype means — Mean ± SE", xaxis_title="Genotype", yaxis_title="Response", **PLOTLY_LAYOUT)
-st.plotly_chart(fig_g, use_container_width=True)
+### DATA QUALITY METRICS
+- Coefficient of Variation: {(overall_std/overall_mean*100):.2f}%
+- Data completeness: {(len(df)/n_observations*100):.1f}%
 
-# 3) Interaction lines: genotype lines across days
-inter_mean = long_df.groupby(["Genotype","Treatment"])["Response"].mean().reset_index()
-fig_int = px.line(inter_mean, x="Treatment", y="Response", color="Genotype", markers=True)
-fig_int.update_layout(title="Interaction plot — Genotype × Day", xaxis_title="Day", yaxis_title="Mean Response", **PLOTLY_LAYOUT)
-st.plotly_chart(fig_int, use_container_width=True)
+===============================================================================
 
-# 4) Heatmap of means (Genotype x Day)
-heat = inter_mean.pivot(index="Genotype", columns="Treatment", values="Response")
-fig_heat = px.imshow(heat.values, x=heat.columns, y=heat.index, aspect="auto", color_continuous_scale="Viridis")
-fig_heat.update_layout(title="Heatmap of Genotype × Day mean response", **PLOTLY_LAYOUT)
-st.plotly_chart(fig_heat, use_container_width=True)
+## METHODOLOGY
 
-# 5) Boxplots: Response by Day, points colored by Genotype
-fig_box = px.box(long_df, x="Treatment", y="Response", color="Genotype", points="all")
-fig_box.update_layout(title="Response distribution by Day (colored by Genotype)", **PLOTLY_LAYOUT)
-st.plotly_chart(fig_box, use_container_width=True)
+### EXPERIMENTAL DESIGN
+This analysis uses Split Plot Design where:
+- Main plots (whole plots) contain genotypes
+- Subplots contain treatments within each main plot
+- This design is efficient for studying factor interactions
 
-# Diagnostics
-st.write("---")
-st.header("Model diagnostics (OLS model)")
+### STATISTICAL METHODS
+- Analysis of Variance (ANOVA) for testing main effects and interactions
+- Tukey's Honestly Significant Difference (HSD) for multiple comparisons
+- Split plot model accounts for different error terms for main plot and subplot factors
 
-resid = ols_model.resid
-fitted = ols_model.fittedvalues
+### SOFTWARE
+- Analysis performed using Python with scipy.stats and statsmodels
+- Visualization created with plotly and matplotlib
+- Report generated automatically by Split Plot Analyzer
 
-# Residuals vs Fitted
-fig_r = go.Figure()
-fig_r.add_trace(go.Scatter(x=fitted, y=resid, mode="markers", marker=dict(opacity=0.7)))
-fig_r.add_hline(y=0, line_dash="dash", line_color="red")
-fig_r.update_layout(title="Residuals vs Fitted (OLS)", xaxis_title="Fitted values", yaxis_title="Residuals", **PLOTLY_LAYOUT)
-st.plotly_chart(fig_r, use_container_width=True)
+===============================================================================
 
-# Q-Q plot
-qq = stats.probplot(resid, dist="norm")
-qq_x, qq_y = qq[0][0], qq[0][1]
-slope, intercept = qq[1][0], qq[1][1]
-fig_qq = go.Figure()
-fig_qq.add_trace(go.Scatter(x=qq_x, y=qq_y, mode="markers", name="Sample"))
-fig_qq.add_trace(go.Scatter(x=qq_x, y=intercept + slope*qq_x, mode="lines", name="Theoretical", line=dict(color="red", dash="dash")))
-fig_qq.update_layout(title="Normal Q-Q plot (OLS residuals)", xaxis_title="Theoretical quantiles", yaxis_title="Sample quantiles", **PLOTLY_LAYOUT)
-st.plotly_chart(fig_qq, use_container_width=True)
+END OF REPORT
+        """
+        
+        return report
+        
+    except Exception as e:
+        return f"Error generating report: {str(e)}"
 
-# Shapiro-Wilk & Levene
-st.subheader("Assumption tests")
-try:
-    sh_w, sh_p = stats.shapiro(resid) if len(resid) <= 5000 else (np.nan, np.nan)
-    st.write(f"Shapiro-Wilk normality test p-value: {sh_p:.6f}" if not np.isnan(sh_p) else "Shapiro-Wilk not computed for >5000 obs")
-except Exception as e:
-    st.write("Shapiro test unavailable:", e)
-
-try:
-    grouped = [g["Response"].values for _, g in long_df.groupby(["Genotype","Treatment"])]
-    if len(grouped) > 1:
-        lev_w, lev_p = stats.levene(*grouped)
-        st.write(f"Levene's test for equal variances p-value: {lev_p:.6f}")
-except Exception as e:
-    st.write("Levene test unavailable:", e)
-
-# ----------------- Export / Downloads -------------------
-st.write("---")
-st.header("Export results")
-
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.download_button("Download long data (CSV)", data=to_csv_bytes(long_df), file_name="long_data.csv", mime="text/csv")
-with col2:
-    anova_out = anova_res.reset_index().rename(columns={"index":"Term"})
-    st.download_button("Download ANOVA (CSV)", data=to_csv_bytes(anova_out), file_name="anova_table.csv", mime="text/csv")
-with col3:
-    st.download_button("Download post-hoc contrasts (CSV)", data=to_csv_bytes(posthoc_df), file_name="posthoc_contrasts.csv", mime="text/csv")
-with col4:
-    if export_report:
-        report_text = generate_report_text(long_df, anova_res, posthoc_df)
-        bio = BytesIO(report_text.encode("utf-8"))
-        st.download_button("Download report (TXT)", data=bio, file_name="splitplot_report.txt", mime="text/plain")
-
-st.markdown("---")
-st.caption("Notes:\n"
-           "- Genotype is treated as the main-plot factor and Day (d1,d2,d3) as subplot (within-genotype) factor.\n"
-           "- OLS ANOVA is displayed (easy-to-read table) and pairwise contrasts are computed using the OLS residual MSE\n"
-           "  to produce contrast SE, t and p-values in the requested format.\n"
-           "- For fully correct split-plot inference, prefer the mixed-effects model results (random intercept for Genotype).\n"
-           "- If you want contrasts computed from mixed-model marginal means (with Satterthwaite df), I can extend the app\n"
-           "  to use emmeans-style approximations (requires additional implementation).")
+if __name__ == "__main__":
+    main()
