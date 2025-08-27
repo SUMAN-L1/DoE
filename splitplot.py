@@ -3,14 +3,16 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 from io import StringIO, BytesIO
-import base64
 import textwrap
 from statsmodels.formula.api import ols
 import statsmodels.api as sm
 from statsmodels.regression.mixed_linear_model import MixedLM
 from statsmodels.stats.multicomp import pairwise_tukeyhsd, MultiComparison
 from scipy import stats
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 # ---------- Helper functions ----------
 
@@ -42,11 +44,9 @@ def pivot_to_long(df):
     id_col = "Genotype"
     value_cols = [c for c in df.columns if c != id_col]
     long = df.melt(id_vars=[id_col], value_vars=value_cols, var_name="Treatment", value_name="Value")
-    # split Treatment into Date and Rep
     if long['Treatment'].str.contains('_').all():
         long[['Date','Rep']] = long['Treatment'].str.split('_', expand=True)
     else:
-        # try splitting by '.' or '-' then underscore fallback
         parts = long['Treatment'].str.split('[._-]', expand=True)
         if parts.shape[1] >= 2:
             long['Date'] = parts[0]
@@ -58,7 +58,6 @@ def pivot_to_long(df):
     long['Rep'] = pd.Categorical(long['Rep'])
     long['Genotype'] = pd.Categorical(long['Genotype'])
     long = long.dropna(subset=['Value'])
-    # coerce numeric
     long['Value'] = pd.to_numeric(long['Value'], errors='coerce')
     long = long.dropna(subset=['Value'])
     return long
@@ -98,10 +97,8 @@ def greedy_cld_from_tukey(mc: MultiComparison, tukey_res):
     """
     Approximate CLD (compact letter display) from tukeyhsd results.
     """
-    # Defensive check: if no groups, return an empty DataFrame
     if not hasattr(mc, 'groupsunique') or len(mc.groupsunique) == 0:
         return pd.DataFrame(columns=["level", "cld", "mean"])
-        
     groups = list(mc.groupsunique)
     table = tukey_res._results_table.data[1:]
     not_diff = {g:{} for g in groups}
@@ -145,7 +142,6 @@ def fig_to_bytes(fig, fmt="png", dpi=300):
     buf.seek(0)
     return buf
 
-# ---------- New Interpretations Function ----------
 def add_interpretations(anova_table, geno_cld, date_cld):
     st.markdown("### 📊 Interpretations of Results")
     st.markdown("""
@@ -192,12 +188,13 @@ def add_interpretations(anova_table, geno_cld, date_cld):
     st.markdown("---")
     st.markdown("#### 🖼️ Understanding the Plots")
     st.markdown("""
-    -   **Interaction Plot**: If lines are parallel, there's no interaction. If they cross or have different slopes, it means there's a significant interaction.
+    -   **Interaction Plot**: If lines are parallel, there's no interaction. If they cross or have different slopes, it means there's a significant interaction. The best genotype is highlighted.
+    -   **Genotype Stability Plot**: Helps identify genotypes that are both high-yielding and stable across dates. The best genotypes are in the top-left quadrant of the plot (low Ecovalence, high yield).
+    -   **PCA Biplot**: This plot is great for visualizing the interaction. Genotypes (points) close to a date (vector) perform well on that date.
     -   **Faceted Boxplots**: These help visualize variability. A tall boxplot means high variability.
     -   **Genotype & Date Means Plots**: The letters (CLD) on top of the bars indicate statistical similarity. Groups with at least one letter in common are **not** statistically different.
     """)
     st.markdown("---")
-
 
 # ---------- Streamlit UI ----------
 st.set_page_config(layout="wide", page_title="Split-Plot Analysis App")
@@ -307,7 +304,7 @@ try:
     st.dataframe(pd.DataFrame(tukey_date_res.summary().data[1:], columns=tukey_date_res.summary().data[0]))
     st.write("### Tukey HSD — Genotype (first 200 comparisons shown)")
     st.dataframe(pd.DataFrame(tukey_geno_res.summary().data[1:], columns=tukey_geno_res.summary().data[0]))
-    
+
     date_cld = greedy_cld_from_tukey(mc_date, tukey_date_res)
     geno_cld = greedy_cld_from_tukey(mc_geno, tukey_geno_res)
     st.write("### Compact Letter Display (approx.) — Date")
@@ -343,37 +340,38 @@ try:
 except Exception as e:
     st.warning(f"Per-Date HSD failed: {e}")
 
-# ... (rest of the code remains the same until the plotting section) ...
-
 # ---------- Publication-quality plots ----------
 st.markdown("---")
 st.markdown("## 📈 Publication-Quality Plots")
 
-# Interaction plot: one line per genotype
+# Interaction plot: one line per genotype (IMPROVED)
+st.markdown("### Interaction Plot: Date × Genotype")
 fig1, ax1 = plt.subplots(figsize=(12,6))
 all_genos = df_long['Genotype'].cat.categories.tolist()
 geno_means_overall = df_long.groupby("Genotype")['Value'].mean()
 best_geno = geno_means_overall.idxmax()
 
-for name, grp in df_long.groupby("Genotype"):
+# Get a color palette
+colors = plt.cm.tab20(np.linspace(0, 1, len(all_genos)))
+color_map = {geno: colors[i] for i, geno in enumerate(all_genos)}
+
+for i, (name, grp) in enumerate(df_long.groupby("Genotype")):
     x = [list(df_long['Date'].cat.categories).index(v) for v in grp['Date']]
     vals = grp.groupby('Date')['Value'].mean().reindex(df_long['Date'].cat.categories).values
     
-    line_style = 'solid'
+    line_style = '-'
     line_width = 1.5
     label = name
-    alpha = 0.6
+    alpha = 0.7
     
     # Highlight the best genotype
     if name == best_geno:
-        color = 'red'  # A distinctive color for the best genotype
         line_width = 3
         alpha = 1.0
         label = f"{name} (Best)"
+        ax1.plot(range(len(vals)), vals, marker='o', linewidth=line_width, alpha=alpha, label=label, color='red')
     else:
-        color = 'grey'
-    
-    ax1.plot(range(len(vals)), vals, marker='o', linewidth=line_width, alpha=alpha, label=label, color=color)
+        ax1.plot(range(len(vals)), vals, marker='o', linewidth=line_width, alpha=alpha, label=label, color=color_map[name])
 
 # Create a custom legend for all genotypes
 ax1.legend(loc='upper left', bbox_to_anchor=(1, 1), fontsize=8, title='Genotypes')
@@ -388,12 +386,140 @@ st.pyplot(fig1)
 buf = fig_to_bytes(fig1, fmt="png")
 st.download_button("Download interaction plot (PNG)", data=buf, file_name="interaction_plot.png", mime="image/png")
 
-# ... (rest of the code for other plots) ...
+# NEW PLOT 1: Genotype Stability Plot (Wricke's Ecovalence)
+st.markdown("### Genotype Stability Plot")
+try:
+    lm_model, anova_table = compute_lm_anova(df_long)
+    residuals = pd.DataFrame(lm_model.resid, index=lm_model.resid.index, columns=['Residual'])
+    residuals = df_long.assign(Residual=residuals['Residual'].values)
 
-# Genotype means with SE and CLD
+    wricke_eco = residuals.groupby('Genotype')['Residual'].apply(lambda x: (x**2).sum())
+    geno_means_plot = df_long.groupby("Genotype")['Value'].mean()
+
+    stability_df = pd.DataFrame({
+        'Genotype': geno_means_plot.index,
+        'Mean': geno_means_plot.values,
+        'Ecovalence': wricke_eco.values
+    })
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    sns.scatterplot(data=stability_df, x='Ecovalence', y='Mean', hue='Genotype', ax=ax, s=100)
+    
+    for _, row in stability_df.iterrows():
+        ax.text(row['Ecovalence'] + 0.5, row['Mean'], row['Genotype'], fontsize=8)
+
+    ax.set_title("Genotype Stability Plot (Wricke's Ecovalence)")
+    ax.set_xlabel("Wricke's Ecovalence (Lower = More Stable)")
+    ax.set_ylabel("Overall Mean Value")
+    ax.grid(True, linestyle=':', alpha=0.6)
+    st.pyplot(fig)
+    buf_stab = fig_to_bytes(fig, fmt="png")
+    st.download_button("Download Stability Plot (PNG)", data=buf_stab, file_name="stability_plot.png", mime="image/png")
+
+except Exception as e:
+    st.warning(f"Could not generate Genotype Stability plot: {e}")
+
+# NEW PLOT 2: PCA Biplot
+st.markdown("### PCA Biplot of Dates and Genotypes")
+try:
+    df_pivot = df_long.pivot_table(index='Genotype', columns='Date', values='Value', aggfunc='mean').fillna(0)
+    dates = df_pivot.columns
+    genotypes = df_pivot.index
+    
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(df_pivot)
+    
+    pca = PCA(n_components=2)
+    pca_result = pca.fit_transform(scaled_data)
+    
+    # Biplot for genotypes (points)
+    fig, ax = plt.subplots(figsize=(12, 10))
+    sns.scatterplot(x=pca_result[:, 0], y=pca_result[:, 1], ax=ax, s=100, label='Genotypes')
+    for i, txt in enumerate(genotypes):
+        ax.text(pca_result[i, 0] + 0.1, pca_result[i, 1] + 0.1, txt, fontsize=8)
+    
+    # Biplot for dates (vectors)
+    loadings = pca.components_.T * np.sqrt(pca.explained_variance_)
+    for i, col_name in enumerate(dates):
+        ax.arrow(0, 0, loadings[i, 0], loadings[i, 1], color='red', alpha=0.8, head_width=0.1)
+        ax.text(loadings[i, 0] * 1.1, loadings[i, 1] * 1.1, col_name, color='red', ha='center', va='center', fontsize=10, fontweight='bold')
+    
+    ax.set_title("PCA Biplot (Genotype-by-Date Interaction)")
+    ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.2f}%)")
+    ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.2f}%)")
+    ax.grid(True, linestyle=':', alpha=0.6)
+    st.pyplot(fig)
+    buf_pca = fig_to_bytes(fig, fmt="png")
+    st.download_button("Download PCA Biplot (PNG)", data=buf_pca, file_name="pca_biplot.png", mime="image/png")
+
+except Exception as e:
+    st.warning(f"Could not generate PCA Biplot: {e}")
+
+# NEW PLOT 3: Heatmap with CLD
+st.markdown("### Heatmap of Genotype x Date Means with CLD")
+try:
+    # Pivot table for the heatmap
+    heatmap_df = df_long.pivot_table(index='Genotype', columns='Date', values='Value', aggfunc='mean')
+    
+    # Get CLD for each date's genotype group
+    cld_data = {}
+    for d in df_long['Date'].cat.categories:
+        sub = df_long[df_long['Date'] == d]
+        if sub['Genotype'].nunique() > 1:
+            mc = MultiComparison(sub['Value'], sub['Genotype'])
+            res = mc.tukeyhsd()
+            cld_df_d = greedy_cld_from_tukey(mc, res)
+            cld_data[d] = cld_df_d.set_index('level')['cld']
+    
+    cld_df_wide = pd.DataFrame(cld_data).reindex(heatmap_df.index).fillna("")
+    
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(12, 12))
+    sns.heatmap(heatmap_df, annot=True, fmt=".2f", cmap="YlGnBu", linewidths=.5, ax=ax, cbar_kws={'label': 'Mean Value'})
+    
+    # Overlay the CLD letters
+    for i in range(cld_df_wide.shape[0]):
+        for j in range(cld_df_wide.shape[1]):
+            text_val = cld_df_wide.iloc[i, j]
+            if text_val:
+                ax.text(j + 0.5, i + 0.7, text_val, ha='center', va='center', color='black', fontsize=10, fontweight='bold')
+
+    ax.set_title("Heatmap of Mean Values by Genotype and Date")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Genotype")
+    ax.tick_params(axis='y', rotation=0)
+    st.pyplot(fig)
+    buf_hm = fig_to_bytes(fig, fmt="png")
+    st.download_button("Download Heatmap (PNG)", data=buf_hm, file_name="heatmap.png", mime="image/png")
+
+except Exception as e:
+    st.warning(f"Could not generate Heatmap: {e}")
+
+# Faceted boxplots (same as before)
+st.markdown("### Faceted Boxplots (Per-genotype distributions)")
+genotypes = df_long['Genotype'].cat.categories.tolist()
+n = len(genotypes)
+cols = 5
+rows = int(np.ceil(n / cols))
+fig2, axes = plt.subplots(rows, cols, figsize=(cols*3, rows*2.5), sharey=True)
+axes = axes.flatten()
+for i, g in enumerate(genotypes):
+    ax = axes[i]
+    sub = df_long[df_long['Genotype'] == g]
+    data_to_plot = [sub[sub['Date'] == d]['Value'].values for d in df_long['Date'].cat.categories]
+    ax.boxplot(data_to_plot, labels=list(df_long['Date'].cat.categories))
+    ax.set_title(str(g), fontsize=8)
+    ax.tick_params(axis='x', labelrotation=45, labelsize=7)
+for j in range(i+1, len(axes)):
+    axes[j].axis('off')
+fig2.suptitle("Per-genotype distributions across Dates (faceted boxplots)")
+st.pyplot(fig2)
+buf2 = fig_to_bytes(fig2, fmt="png")
+st.download_button("Download faceted boxplots (PNG)", data=buf2, file_name="faceted_boxplots.png", mime="image/png")
+
+# Genotype means with SE and CLD (same as before)
+st.markdown("### Genotype Means with SE and CLD")
 geno_means = df_long.groupby("Genotype")['Value'].agg(['mean', 'sem']).reset_index().rename(columns={'sem':'se'})
-
-# This is the crucial fix
 if geno_means.empty:
     st.warning("No data available to plot genotype means.")
 else:
@@ -402,10 +528,7 @@ else:
     else:
         geno_plot_df = geno_means.copy()
         geno_plot_df['cld'] = ""
-
-    # Sort by mean
     geno_plot_df = geno_plot_df.sort_values('mean', ascending=False).reset_index(drop=True)
-
     fig3, ax3 = plt.subplots(figsize=(14,6))
     ax3.bar(range(len(geno_plot_df)), geno_plot_df['mean'])
     ax3.errorbar(range(len(geno_plot_df)), geno_plot_df['mean'], yerr=geno_plot_df['se'].fillna(0), fmt='none', capsize=3)
@@ -421,6 +544,57 @@ else:
     buf3 = fig_to_bytes(fig3, fmt="png")
     st.download_button("Download genotype means plot (PNG)", data=buf3, file_name="genotype_means.png", mime="image/png")
     download_button_df(geno_plot_df, "genotype_means_cld.csv", "Download genotype means + CLD (CSV)")
+
+# Date means with SE and CLD (same as before)
+st.markdown("### Date Means with SE and CLD")
+date_means = df_long.groupby("Date")['Value'].agg(['mean','sem']).reset_index().rename(columns={'sem':'se'})
+if date_cld is not None and not date_cld.empty:
+    date_plot_df = date_means.merge(date_cld.rename(columns={"level":"Date"}), how='left', left_on="Date", right_on="Date")
+else:
+    date_plot_df = date_means.copy()
+    date_plot_df['cld'] = ""
+fig4, ax4 = plt.subplots(figsize=(6,5))
+ax4.bar(range(len(date_plot_df)), date_plot_df['mean'], width=0.5)
+ax4.errorbar(range(len(date_plot_df)), date_plot_df['mean'], yerr=date_plot_df['se'].fillna(0), fmt='none', capsize=4)
+ax4.set_xticks(range(len(date_plot_df)))
+ax4.set_xticklabels(date_plot_df['Date'], fontsize=10)
+ax4.set_ylabel("Estimated mean (EMM-like)")
+ax4.set_title("Date estimated means with SE and CLD (approx.)")
+for i, r in date_plot_df.iterrows():
+    ax4.text(i, r['mean'] + (r['se'] if not np.isnan(r['se']) else 0.05), str(r.get('cld','')), ha='center', va='bottom')
+ax4.grid(axis='y', linestyle=':', linewidth=0.4)
+st.pyplot(fig4)
+buf4 = fig_to_bytes(fig4, fmt="png")
+st.download_button("Download date means plot (PNG)", data=buf4, file_name="date_means.png", mime="image/png")
+download_button_df(date_plot_df, "date_means_cld.csv", "Download date means + CLD (CSV)")
+
+# Mean ± SE by Date × Genotype (grouped bar) (same as before)
+st.markdown("---")
+st.markdown("### Mean ± SE by Date × Genotype (top N genotypes)")
+top_n = st.slider("Number of top genotypes to show", min_value=4, max_value=min(19, len(geno_plot_df)), value=8)
+top_genos = geno_plot_df.head(top_n)['Genotype'].tolist()
+subset = df_long[df_long['Genotype'].isin(top_genos)]
+summary = subset.groupby(['Genotype','Date'])['Value'].agg(['mean','sem']).reset_index().rename(columns={'sem':'se','mean':'Value'})
+fig5, ax5 = plt.subplots(figsize=(max(8, top_n*0.8), 5))
+genos = summary['Genotype'].unique()
+dates = sorted(summary['Date'].unique())
+x = np.arange(len(genos))
+width = 0.2
+for i, d in enumerate(dates):
+    vals = summary[summary['Date']==d]['Value'].values
+    errs = summary[summary['Date']==d]['se'].values
+    ax5.bar(x + (i - (len(dates)-1)/2)*width, vals, width=width, label=str(d))
+    ax5.errorbar(x + (i - (len(dates)-1)/2)*width, vals, yerr=errs, fmt='none', capsize=3)
+ax5.set_xticks(x)
+ax5.set_xticklabels(genos, rotation=90)
+ax5.set_ylabel("Mean value")
+ax5.set_title(f"Mean ± SE by Date and Genotype (top {top_n})")
+ax5.legend(title="Date")
+ax5.grid(axis='y', linestyle=':', linewidth=0.4)
+st.pyplot(fig5)
+buf5 = fig_to_bytes(fig5, fmt="png")
+st.download_button("Download grouped means plot (PNG)", data=buf5, file_name="means_by_date_genotype.png", mime="image/png")
+download_button_df(summary, "mean_se_by_date_genotype_topN.csv", "Download mean±SE (CSV)")
 
 st.markdown("---")
 st.markdown("### 📝 Notes & Limitations")
