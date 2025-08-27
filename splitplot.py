@@ -528,7 +528,12 @@ else:
     else:
         geno_plot_df = geno_means.copy()
         geno_plot_df['cld'] = ""
-    geno_plot_df = geno_plot_df.sort_values('mean', ascending=False).reset_index(drop=True)
+    if 'mean' in geno_plot_df.columns:
+        geno_plot_df = geno_plot_df.sort_values('mean', ascending=False).reset_index(drop=True)
+    else:
+        # Fallback if 'mean' is somehow missing
+        geno_plot_df = geno_plot_df.sort_values('Genotype', ascending=True).reset_index(drop=True)
+
     fig3, ax3 = plt.subplots(figsize=(14,6))
     ax3.bar(range(len(geno_plot_df)), geno_plot_df['mean'])
     ax3.errorbar(range(len(geno_plot_df)), geno_plot_df['mean'], yerr=geno_plot_df['se'].fillna(0), fmt='none', capsize=3)
