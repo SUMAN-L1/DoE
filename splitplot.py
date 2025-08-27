@@ -196,9 +196,20 @@ def add_interpretations(anova_table, geno_cld, date_cld):
     st.markdown("---")
 
 # ---------- Streamlit UI ----------
-st.set_page_config(layout="wide", page_title="Split-Plot Analysis App")
-st.title("🌱 Split-Plot Analyser")
-st.subtitle ("Developed by Bhavya")
+# Set page config
+st.set_page_config(layout="wide", page_title="Split-Plot Analyser")
+
+# Title with style
+st.markdown(
+    "<h1 style='text-align: center; color: green;'>🌱 Split-Plot Analyser</h1>", 
+    unsafe_allow_html=True
+)
+
+# Subtitle with style
+st.markdown(
+    "<h3 style='text-align: center; color: gray;'>Developed by Bhavya</h3>", 
+    unsafe_allow_html=True
+)
 st.markdown("""
 This app performs split-plot analysis for data with columns named like `d1_r1`, `d1_r2`, etc.
 - **Main-plot** = Date (d1, d2, d3)
