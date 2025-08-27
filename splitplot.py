@@ -520,29 +520,6 @@ st.pyplot(fig2)
 buf2 = fig_to_bytes(fig2, fmt="png")
 st.download_button("Download faceted boxplots (PNG)", data=buf2, file_name="faceted_boxplots.png", mime="image/png")
 
-# Date means with SE and CLD (same as before)
-st.markdown("### Date Means with SE and CLD")
-date_means = df_long.groupby("Date")['Value'].agg(['mean','sem']).reset_index().rename(columns={'sem':'se'})
-if date_cld is not None and not date_cld.empty:
-    date_plot_df = date_means.merge(date_cld.rename(columns={"level":"Date"}), how='left', left_on="Date", right_on="Date")
-else:
-    date_plot_df = date_means.copy()
-    date_plot_df['cld'] = ""
-fig4, ax4 = plt.subplots(figsize=(6,5))
-ax4.bar(range(len(date_plot_df)), date_plot_df['mean'], width=0.5)
-ax4.errorbar(range(len(date_plot_df)), date_plot_df['mean'], yerr=date_plot_df['se'].fillna(0), fmt='none', capsize=4)
-ax4.set_xticks(range(len(date_plot_df)))
-ax4.set_xticklabels(date_plot_df['Date'], fontsize=10)
-ax4.set_ylabel("Estimated mean (EMM-like)")
-ax4.set_title("Date estimated means with SE and CLD (approx.)")
-for i, r in date_plot_df.iterrows():
-    ax4.text(i, r['mean'] + (r['se'] if not np.isnan(r['se']) else 0.05), str(r.get('cld','')), ha='center', va='bottom')
-ax4.grid(axis='y', linestyle=':', linewidth=0.4)
-st.pyplot(fig4)
-buf4 = fig_to_bytes(fig4, fmt="png")
-st.download_button("Download date means plot (PNG)", data=buf4, file_name="date_means.png", mime="image/png")
-download_button_df(date_plot_df, "date_means_cld.csv", "Download date means + CLD (CSV)")
-
 # Mean ± SE by Date × Genotype (grouped bar) (same as before)
 st.markdown("---")
 st.markdown("### Mean ± SE by Date × Genotype (top N genotypes)")
