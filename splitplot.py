@@ -116,7 +116,7 @@ def auto_transform_wide_data(df):
         
         # Get all other columns as potential treatments
         treatment_cols = df.columns[1:].tolist()
-        
+         
         # Create long format
         df_melted = df.melt(id_vars=[main_plot_col], 
                            value_vars=treatment_cols,
