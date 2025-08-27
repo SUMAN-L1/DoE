@@ -1,141 +1,124 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import statsmodels.api as sm
-from statsmodels.formula.api import ols
-from statsmodels.stats.multicomp import pairwise_tukeyhsd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from statsmodels.formula.api import ols
+from statsmodels.stats.anova import anova_lm
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
 import io
 
-st.set_page_config(page_title="ANOVA & Tukey HSD Analysis", layout="wide")
+# ----------------------------
+# Streamlit App Title
+# ----------------------------
+st.title("ANOVA and Tukey HSD Analysis for Genotypes")
+st.write("Upload your dataset to perform ANOVA, Tukey HSD, and generate high-quality visualizations with interpretations.")
 
-# ------------------------------
-# APP TITLE
-# ------------------------------
-st.title("ANOVA with Tukey HSD and Genotype Comparison")
-st.write("""
-This app performs **ANOVA, Tukey HSD test, and visualizations** for randomized block or factorial designs.  
-Upload your dataset and explore the results with interpretations suitable for scientific publications.
-""")
-
-# ------------------------------
-# FILE UPLOAD
-# ------------------------------
-uploaded_file = st.file_uploader("Upload your dataset (.csv, .xls, .xlsx):", type=["csv", "xls", "xlsx"])
-
-if uploaded_file:
-    # Read file
-    if uploaded_file.name.endswith('.csv'):
-        data = pd.read_csv(uploaded_file)
+# ----------------------------
+# File Upload
+# ----------------------------
+uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx", "xls"])
+if uploaded_file is not None:
+    # Detect file type
+    if uploaded_file.name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
     else:
-        data = pd.read_excel(uploaded_file)
+        df = pd.read_excel(uploaded_file)
 
-    st.subheader("Data Preview")
-    st.write(data.head())
+    st.subheader("📂 Preview of Uploaded Data")
+    st.write(df.head())
 
-    # ------------------------------
-    # COLUMN SELECTION
-    # ------------------------------
-    st.sidebar.header("Select Columns for Analysis")
-    main_factor = st.sidebar.selectbox("Select Main Plot Factor (e.g., Drought Levels):", data.columns)
-    sub_factor = st.sidebar.selectbox("Select Sub Plot Factor (e.g., Genotypes):", data.columns)
-    replication = st.sidebar.selectbox("Select Replication Column:", data.columns)
-    response_var = st.sidebar.selectbox("Select Response Variable:", data.columns)
+    # ----------------------------
+    # Data Columns Selection
+    # ----------------------------
+    st.subheader("🔍 Select Columns for Analysis")
+    response_var = st.selectbox("Select the response variable (numeric)", df.columns)
+    main_plot = st.selectbox("Select the main plot factor", df.columns)
+    genotype = st.selectbox("Select the genotype factor", df.columns)
+    replication = st.selectbox("Select the replication factor", df.columns)
 
-    if main_factor and sub_factor and replication and response_var:
-        st.markdown("### Step 1: ANOVA Model Fitting")
-        
-        # ------------------------------
-        # MODEL FITTING
-        # ------------------------------
-        formula = f"{response_var} ~ C({main_factor}) * C({sub_factor}) + C({replication})"
-        model = ols(formula, data=data).fit()
-        anova_table = sm.stats.anova_lm(model, typ=2)
-        
-        st.write("**ANOVA Table:**")
-        st.dataframe(anova_table)
+    # Ensure categorical data type for factors
+    df[main_plot] = df[main_plot].astype(str)
+    df[genotype] = df[genotype].astype(str)
+    df[replication] = df[replication].astype(str)
 
-        # Interpretation
-        st.markdown("**Interpretation:**")
-        st.write("""
-        - If p-value < 0.05 for a factor, it means the factor has a statistically significant effect on the response variable.
-        - Interaction term indicates whether the effect of one factor depends on the level of another.
-        """)
+    st.write(f"**Selected Response Variable:** {response_var}")
+    st.write(f"**Main Plot:** {main_plot}, **Genotype:** {genotype}, **Replication:** {replication}")
 
-        # ------------------------------
-        # Tukey HSD for sub_factor
-        # ------------------------------
-        st.markdown("### Step 2: Tukey HSD Test for Genotypes")
-        tukey = pairwise_tukeyhsd(endog=data[response_var], groups=data[sub_factor], alpha=0.05)
-        st.text(tukey.summary())
+    # ----------------------------
+    # ANOVA Model
+    # ----------------------------
+    formula = f"{response_var} ~ C({main_plot}) + C({genotype}) + C({replication})"
+    model = ols(formula, data=df).fit()
+    anova_results = anova_lm(model, typ=2)
 
-        # Interpretation
-        st.markdown("**Interpretation:**")
-        st.write("""
-        - Groups sharing the same letter are not significantly different at 5% significance level.
-        - Significant differences indicate which genotypes perform differently under the given conditions.
-        """)
+    st.subheader("📊 ANOVA Table")
+    st.write(anova_results)
 
-        # ------------------------------
-        # Group Means for Best Genotype
-        # ------------------------------
-        group_means = data.groupby(sub_factor)[response_var].mean().sort_values(ascending=False)
-        best_genotype = group_means.index[0]
-        second_best = group_means.index[1]
-        best_value = group_means.iloc[0]
-        second_value = group_means.iloc[1]
-        advantage = ((best_value - second_value) / second_value) * 100
+    # ✅ Interpretation of ANOVA
+    st.markdown("### 📌 Interpretation of ANOVA Results")
+    for factor in [main_plot, genotype, replication]:
+        p_value = anova_results.loc[f"C({factor})", "PR(>F)"]
+        if p_value < 0.05:
+            st.write(f"**{factor}** has a **significant effect** on {response_var} (p = {p_value:.4f}).")
+        else:
+            st.write(f"**{factor}** does **not have a significant effect** on {response_var} (p = {p_value:.4f}).")
 
-        st.markdown("### Step 3: Best Genotype Identification")
-        st.write(f"**Best Genotype:** {best_genotype} with mean {response_var} = {best_value:.2f}")
-        st.write(f"It performs **{advantage:.2f}% better** than the second-best genotype ({second_best}).")
+    # ----------------------------
+    # Tukey HSD Test
+    # ----------------------------
+    st.subheader("📌 Tukey HSD Test for Genotypes")
+    tukey = pairwise_tukeyhsd(endog=df[response_var], groups=df[genotype], alpha=0.05)
+    st.text(tukey)
 
-        # ------------------------------
-        # Visualization Section
-        # ------------------------------
-        st.markdown("### Step 4: Visualizations")
+    # ✅ Interpretation of Tukey
+    st.markdown("### 📌 Interpretation of Tukey HSD")
+    st.write("Groups marked as 'True' in the 'reject' column differ **significantly** in their means.")
 
-        # Boxplot
-        st.subheader("Boxplot: Genotype vs Response")
-        fig1, ax1 = plt.subplots(figsize=(8, 6))
-        sns.boxplot(x=sub_factor, y=response_var, data=data, ax=ax1)
-        ax1.set_title(f"{sub_factor} vs {response_var}")
-        plt.xticks(rotation=45)
-        st.pyplot(fig1)
+    # ----------------------------
+    # Identify Best Genotype
+    # ----------------------------
+    st.subheader("🏆 Best Genotype Identification")
+    genotype_means = df.groupby(genotype)[response_var].mean().sort_values(ascending=False)
+    best_genotype = genotype_means.index[0]
+    best_value = genotype_means.iloc[0]
+    second_best = genotype_means.iloc[1]
+    improvement = ((best_value - second_best) / second_best) * 100
 
-        st.write("**Interpretation:** The spread of values for each genotype is shown. Narrow boxes indicate stability; higher medians indicate better performance.")
+    st.write(f"**Best Genotype:** {best_genotype} with mean {best_value:.2f}")
+    st.write(f"It is **{improvement:.2f}% better** than the second-best genotype.")
 
-        # Interaction Plot
-        st.subheader("Interaction Plot: Main Factor x Sub Factor")
-        fig2, ax2 = plt.subplots(figsize=(8, 6))
-        means = data.groupby([main_factor, sub_factor])[response_var].mean().unstack()
-        means.T.plot(ax=ax2, marker='o')
-        ax2.set_title("Interaction between Main Plot and Genotypes")
-        ax2.set_ylabel(response_var)
-        st.pyplot(fig2)
+    # ----------------------------
+    # Visualizations
+    # ----------------------------
+    st.subheader("📈 Visualizations")
 
-        st.write("**Interpretation:** Lines crossing indicate interaction effects. Parallel lines indicate no interaction.")
+    # Genotype Means Plot
+    st.markdown("#### 🔹 Mean Comparison of Genotypes")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.barplot(x=genotype_means.index, y=genotype_means.values, palette="viridis", ax=ax)
+    plt.xticks(rotation=45)
+    plt.title("Mean Response for Each Genotype", fontsize=14)
+    plt.ylabel(response_var)
+    st.pyplot(fig)
 
-        # Bar Chart of Means
-        st.subheader("Mean Performance of Genotypes")
-        fig3, ax3 = plt.subplots(figsize=(8, 6))
-        group_means.plot(kind='bar', ax=ax3)
-        ax3.set_ylabel(f"Mean {response_var}")
-        ax3.set_title("Genotype Performance")
-        st.pyplot(fig3)
+    st.markdown("**Interpretation:** This plot shows the average performance of each genotype. The tallest bar corresponds to the best-performing genotype.")
 
-        st.write(f"**Interpretation:** {best_genotype} stands out as the top performer, with a clear margin over others.")
+    # Boxplot
+    st.markdown("#### 🔹 Boxplot for Genotypes")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.boxplot(x=df[genotype], y=df[response_var], palette="Set2", ax=ax)
+    plt.xticks(rotation=45)
+    plt.title("Distribution of Response Variable by Genotype", fontsize=14)
+    st.pyplot(fig)
 
-        # Download Results
-        st.markdown("### Download Results")
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            data.to_excel(writer, sheet_name="Raw Data", index=False)
-            anova_table.to_excel(writer, sheet_name="ANOVA")
-            pd.DataFrame(tukey.summary().data).to_excel(writer, sheet_name="TukeyHSD", index=False)
-            pd.DataFrame(group_means).to_excel(writer, sheet_name="Genotype Means")
-        st.download_button("Download Results as Excel", data=output.getvalue(), file_name="ANOVA_Tukey_Results.xlsx")
+    st.markdown("**Interpretation:** The boxplot helps assess variability within each genotype. Smaller boxes indicate consistency, while wider boxes indicate more variation.")
 
-else:
-    st.info("Please upload a dataset to start the analysis.")
+    # Main Plot Effect
+    st.markdown("#### 🔹 Effect of Main Plot Factor")
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sns.barplot(x=df[main_plot], y=df[response_var], estimator=np.mean, ci="sd", palette="coolwarm", ax=ax)
+    plt.title(f"Effect of {main_plot} on {response_var}", fontsize=14)
+    st.pyplot(fig)
+
+    st.markdown(f"**Interpretation:** This shows the average effect of different {main_plot} levels on the response variable.")
