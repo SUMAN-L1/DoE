@@ -1,4 +1,3 @@
-```python
 # split_plot_analyser_app.py
 # -------------------------------------------------------------------
 # Split plot analyser — Streamlit app
@@ -458,4 +457,3 @@ st.caption("Notes: This app fits a two-way model Response ~ Genotype * Treatment
            "For full split-plot models with separate whole-plot and sub-plot error terms, a mixed-model\n"
            "or specialized split-plot routine is recommended. The app provides an optional mixed-effect\n"
            "model (random intercept Genotype) as a quick check.")
-```
