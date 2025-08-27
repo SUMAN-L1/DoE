@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -189,8 +188,8 @@ def add_interpretations(anova_table, geno_cld, date_cld):
     st.markdown("#### 🖼️ Understanding the Plots")
     st.markdown("""
     -   **Interaction Plot**: If lines are parallel, there's no interaction. If they cross or have different slopes, it means there's a significant interaction. The best genotype is highlighted.
-    -   **Genotype Stability Plot**: Helps identify genotypes that are both high-yielding and stable across dates. The best genotypes are in the top-left quadrant of the plot (low Ecovalence, high yield).
-    -   **PCA Biplot**: This plot is great for visualizing the interaction. Genotypes (points) close to a date (vector) perform well on that date.
+    -   **Genotype Stability Plot**: . This plot helps you identify genotypes that are both **high-yielding** and **stable** across different dates. The **X-axis (Wricke's Ecovalence)** measures stability, with a lower value indicating more consistency. The **Y-axis (Overall Mean)** shows average performance. The most desirable genotypes are in the **top-left quadrant**, as they combine high yield with high stability.
+    -   **PCA Biplot**: . This plot visualizes the complex genotype-by-date interaction. Each **point** represents a genotype, and each **arrow** represents a date. A genotype point located in the same direction as a date arrow performed well on that date. Genotypes near the center are less responsive to environmental differences. The angles between the arrows and points show the correlation.
     -   **Faceted Boxplots**: These help visualize variability. A tall boxplot means high variability.
     -   **Genotype & Date Means Plots**: The letters (CLD) on top of the bars indicate statistical similarity. Groups with at least one letter in common are **not** statistically different.
     """)
@@ -466,10 +465,14 @@ try:
     for d in df_long['Date'].cat.categories:
         sub = df_long[df_long['Date'] == d]
         if sub['Genotype'].nunique() > 1:
-            mc = MultiComparison(sub['Value'], sub['Genotype'])
-            res = mc.tukeyhsd()
-            cld_df_d = greedy_cld_from_tukey(mc, res)
-            cld_data[d] = cld_df_d.set_index('level')['cld']
+            try:
+                mc = MultiComparison(sub['Value'], sub['Genotype'])
+                res = mc.tukeyhsd()
+                cld_df_d = greedy_cld_from_tukey(mc, res)
+                cld_data[d] = cld_df_d.set_index('level')['cld']
+            except Exception as e_cld:
+                st.warning(f"Could not generate CLD for date {d}: {e_cld}")
+                continue # Skip to the next date
     
     cld_df_wide = pd.DataFrame(cld_data).reindex(heatmap_df.index).fillna("")
     
@@ -528,11 +531,12 @@ else:
     else:
         geno_plot_df = geno_means.copy()
         geno_plot_df['cld'] = ""
+    # Explicitly check for 'mean' column before sorting
     if 'mean' in geno_plot_df.columns:
         geno_plot_df = geno_plot_df.sort_values('mean', ascending=False).reset_index(drop=True)
     else:
-        # Fallback if 'mean' is somehow missing
-        geno_plot_df = geno_plot_df.sort_values('Genotype', ascending=True).reset_index(drop=True)
+        st.warning("Could not find 'mean' column for sorting. Displaying unsorted data.")
+        geno_plot_df = geno_plot_df.reset_index(drop=True)
 
     fig3, ax3 = plt.subplots(figsize=(14,6))
     ax3.bar(range(len(geno_plot_df)), geno_plot_df['mean'])
