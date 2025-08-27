@@ -1,441 +1,141 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from io import StringIO, BytesIO
-import base64
-import textwrap
-from statsmodels.formula.api import ols
 import statsmodels.api as sm
-from statsmodels.regression.mixed_linear_model import MixedLM
-from statsmodels.stats.multicomp import pairwise_tukeyhsd, MultiComparison
-from scipy import stats
+from statsmodels.formula.api import ols
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import io
 
-# ---------- Helper functions ----------
+st.set_page_config(page_title="ANOVA & Tukey HSD Analysis", layout="wide")
 
-def read_input_file(uploaded_file):
-    """Read csv/xlsx/xls into pandas DataFrame."""
-    if uploaded_file is None:
-        return None
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    elif name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(uploaded_file)
-    else:
-        raise ValueError("Unsupported file type")
-
-def safe_drop_mean(df):
-    """Remove 'Mean' column if present (case-insensitive)."""
-    cols = df.columns.str.lower()
-    if "mean" in cols:
-        idx = int(np.where(cols == "mean")[0][0])
-        df2 = df.drop(df.columns[idx], axis=1)
-        return df2
-    return df.copy()
-
-def pivot_to_long(df):
-    """Expect a 'Genotype' column and treatment columns like d1_r1, d1_r2, etc."""
-    if "Genotype" not in df.columns:
-        raise ValueError("Input must contain a 'Genotype' column")
-    id_col = "Genotype"
-    value_cols = [c for c in df.columns if c != id_col]
-    long = df.melt(id_vars=[id_col], value_vars=value_cols, var_name="Treatment", value_name="Value")
-    # split Treatment into Date and Rep
-    if long['Treatment'].str.contains('_').all():
-        long[['Date','Rep']] = long['Treatment'].str.split('_', expand=True)
-    else:
-        # try splitting by '.' or '-' then underscore fallback
-        parts = long['Treatment'].str.split('[._-]', expand=True)
-        if parts.shape[1] >= 2:
-            long['Date'] = parts[0]
-            long['Rep'] = parts[1]
-        else:
-            raise ValueError("Treatment columns must be named like 'd1_r1' (Date_Rep).")
-    long = long.drop(columns=["Treatment"])
-    long['Date'] = pd.Categorical(long['Date'], categories=sorted(long['Date'].unique(), key=lambda x: x))
-    long['Rep'] = pd.Categorical(long['Rep'])
-    long['Genotype'] = pd.Categorical(long['Genotype'])
-    long = long.dropna(subset=['Value'])
-    # coerce numeric
-    long['Value'] = pd.to_numeric(long['Value'], errors='coerce')
-    long = long.dropna(subset=['Value'])
-    return long
-
-def compute_lm_anova(df_long):
-    """OLS model used for emmeans-like estimates and ANOVA tables."""
-    formula = "Value ~ C(Date)*C(Genotype) + C(Rep)"
-    model = ols(formula, data=df_long).fit()
-    anova_table = sm.stats.anova_lm(model, typ=2)  # Type II ANOVA
-    return model, anova_table
-
-def fit_mixedlm(df_long):
-    """
-    Fit a Mixed Linear Model approximating split-plot:
-    Random intercept for Rep (block) and variance component for Rep:Date (whole-plot).
-    """
-    # Create numeric indices for categories if needed for MixedLM internals
-    # Use groups = Rep, vc for Rep:Date
-    try:
-        vc = {"RepDate": "0 + C(Rep):C(Date)"}
-        md = MixedLM.from_formula("Value ~ C(Date)*C(Genotype)", groups="Rep", vc_formula=vc, data=df_long)
-        mdf = md.fit(reml=True)
-        return mdf
-    except Exception as e:
-        # fallback: try simpler random intercept only
-        try:
-            md = MixedLM.from_formula("Value ~ C(Date)*C(Genotype)", groups="Rep", data=df_long)
-            mdf = md.fit(reml=True)
-            return mdf
-        except Exception as e2:
-            raise RuntimeError(f"MixedLM failed: {e} | fallback failed: {e2}")
-
-def tukey_tests(df_long, factor):
-    """Run Tukey HSD using statsmodels MultiComparison."""
-    mc = MultiComparison(df_long["Value"], df_long[factor])
-    res = mc.tukeyhsd()
-    # return results object and the MultiComparison
-    return res, mc
-
-def greedy_cld_from_tukey(mc: MultiComparison, tukey_res):
-    """
-    Approximate CLD (compact letter display) from tukeyhsd results.
-    This is a greedy assignment and approximate (use R's multcompView/agricolae in R for exact behaviour).
-    """
-    groups = list(mc.groupsunique)
-    # Obtain pairwise info
-    table = tukey_res._results_table.data[1:]
-    # Build "not different" map (True if NOT significantly different)
-    not_diff = {g:{} for g in groups}
-    for r in table:
-        g1, g2, meandiff, p_adj, lower, upper, reject = r
-        # reject==True means significantly different
-        not_diff[g1][g2] = (not reject)
-        not_diff[g2][g1] = (not reject)
-    # pair self
-    for g in groups:
-        not_diff[g][g] = True
-    # compute group means for ordering
-    means = df_long.groupby(mc.groups)[ "Value"].mean().reindex(groups)
-    sorted_groups = list(means.sort_values(ascending=False).index)
-    letters = {}
-    current_letter = ord('a')
-    for g in sorted_groups:
-        if g in letters:
-            continue
-        letter = chr(current_letter)
-        letters[g] = letters.get(g, "") + letter
-        # try to add other groups to this letter
-        for h in sorted_groups:
-            if h in letters:
-                continue
-            # check whether h is not significantly different from ALL groups already assigned this letter
-            assigned = [gg for gg,lab in letters.items() if letter in lab]
-            ok = True
-            for gg in assigned:
-                if h not in not_diff or gg not in not_diff[h] or not not_diff[h][gg]:
-                    ok = False
-                    break
-            if ok:
-                letters[h] = letters.get(h, "") + letter
-        current_letter += 1
-    # create DataFrame
-    cld_df = pd.DataFrame({"group": sorted_groups, "cld": [letters.get(g, "") for g in sorted_groups], "mean": means.loc[sorted_groups].values})
-    cld_df = cld_df.rename(columns={"group":"level"})
-    return cld_df
-
-def download_button_df(df, filename, button_label):
-    csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button(button_label, data=csv, file_name=filename, mime='text/csv')
-
-def fig_to_bytes(fig, fmt="png", dpi=300):
-    buf = BytesIO()
-    fig.savefig(buf, format=fmt, bbox_inches='tight', dpi=dpi)
-    buf.seek(0)
-    return buf
-
-# ---------- Streamlit UI ----------
-
-st.set_page_config(layout="wide", page_title="Split-Plot Analysis (Date main × Genotype subplot)")
-st.title("Split-Plot Analysis App (Date main plot, Genotype subplot)")
-
-st.markdown("""
-This app performs split-plot analysis for data with columns named like `d1_r1`, `d1_r2`, `d2_r1`, etc.
-- **Main-plot** = Date (d1, d2, d3)
-- **Sub-plot** = Genotype (g1..g19)
-- **Replications** = r1, r2
-
-Upload your file (.csv, .xlsx, .xls) or use the example dataset.
+# ------------------------------
+# APP TITLE
+# ------------------------------
+st.title("ANOVA with Tukey HSD and Genotype Comparison")
+st.write("""
+This app performs **ANOVA, Tukey HSD test, and visualizations** for randomized block or factorial designs.  
+Upload your dataset and explore the results with interpretations suitable for scientific publications.
 """)
 
-# Example dataset
-example_csv = """Genotype,d1_r1,d1_r2,d2_r1,d2_r2,d3_r1,d3_r2,Mean
-g1,36.86,37.97,38.47,37.47,40.87,42.40,39.01
-g2,39.58,41.30,44.03,42.21,45.86,41.58,42.43
-g3,38.02,34.57,33.96,36.35,37.69,37.06,36.28
-g4,39.91,37.84,35.67,33.78,37.82,43.35,38.06
-g5,35.94,36.35,39.12,38.03,41.23,42.22,38.82
-g6,49.45,48.56,47.49,49.25,49.90,49.21,48.98
-g7,38.76,44.30,45.74,44.69,48.21,48.10,44.97
-g8,43.28,40.37,34.71,38.14,47.52,41.39,40.90
-g9,41.08,41.79,44.44,38.67,47.38,48.45,43.64
-g10,39.93,40.56,39.67,44.64,42.80,45.18,42.13
-g11,37.13,34.82,36.48,36.81,38.36,35.67,36.55
-g12,31.50,32.13,33.40,32.29,37.22,39.80,34.39
-g13,35.53,35.00,34.19,34.36,41.98,36.33,36.23
-g14,39.51,38.78,40.34,36.04,46.08,44.16,40.82
-g15,35.08,36.98,40.17,39.93,47.16,46.95,41.04
-g16,31.56,28.94,31.49,31.30,37.92,36.67,32.98
-g17,42.14,43.49,44.14,43.74,47.47,48.33,44.88
-g18,37.38,31.96,42.46,43.79,39.74,39.24,39.10
-g19,36.62,36.98,36.18,36.86,40.56,38.92,37.69
-"""
+# ------------------------------
+# FILE UPLOAD
+# ------------------------------
+uploaded_file = st.file_uploader("Upload your dataset (.csv, .xls, .xlsx):", type=["csv", "xls", "xlsx"])
 
-uploaded_file = st.file_uploader("Upload CSV/XLSX file", type=["csv","xlsx","xls"])
-use_example = st.checkbox("Use example dataset (ignore upload)", value=False)
-
-if uploaded_file is None and not use_example:
-    st.info("Upload a file or check 'Use example dataset'.")
-    st.stop()
-
-if use_example:
-    data = pd.read_csv(StringIO(example_csv))
-else:
-    try:
-        data = read_input_file(uploaded_file)
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
-        st.stop()
-
-st.subheader("Raw data (first 10 rows)")
-st.dataframe(data.head(10))
-
-# Clean + pivot
-try:
-    data2 = safe_drop_mean(data)
-    df_long = pivot_to_long(data2)
-except Exception as e:
-    st.error(f"Data transformation failed: {e}")
-    st.stop()
-
-st.subheader("Long-format data (first 20 rows)")
-st.dataframe(df_long.head(20))
-
-st.markdown(f"- Observations: **{len(df_long)}**  \n- Dates (main-plot): {list(df_long['Date'].cat.categories)}  \n- Genotypes (subplot): {len(df_long['Genotype'].cat.categories)}  \n- Replications: {list(df_long['Rep'].cat.categories)}")
-
-# Fit models
-st.markdown("## Model fitting")
-col1, col2 = st.columns(2)
-
-with col1:
-    st.write("### Mixed Linear Model (split-plot structure approximation)")
-    run_mixed = st.button("Fit MixedLM")
-    if run_mixed:
-        try:
-            mdf = fit_mixedlm(df_long)
-            st.success("MixedLM fitted")
-            st.text(str(mdf.summary()))
-        except Exception as e:
-            st.error(f"MixedLM failed: {e}")
-
-with col2:
-    st.write("### Complementary OLS (for ANOVA table & Tukey)")
-    run_ols = st.button("Fit OLS & ANOVA")
-    if run_ols:
-        try:
-            lm_model, anova_table = compute_lm_anova(df_long)
-            st.write("Type II ANOVA (OLS):")
-            st.dataframe(anova_table.style.format("{:.4f}"))
-        except Exception as e:
-            st.error(f"OLS/ANOVA failed: {e}")
-            lm_model = None
-
-# Always compute OLS/ANOVA for subsequent steps (try automatically)
-try:
-    lm_model, anova_table = compute_lm_anova(df_long)
-except Exception as e:
-    st.error(f"OLS/ANOVA failed for downstream steps: {e}")
-    lm_model = None
-    anova_table = None
-
-# Post-hoc Tukey
-st.markdown("## Post-hoc: Tukey HSD & Compact Letter Display")
-try:
-    tukey_date_res, mc_date = tukey_tests(df_long, "Date")
-    tukey_geno_res, mc_geno = tukey_tests(df_long, "Genotype")
-
-    st.write("### Tukey HSD — Date")
-    st.text(tukey_date_res.summary())
-    st.write("### Tukey HSD — Genotype (first 200 comparisons shown)")
-    st.text(tukey_geno_res.summary())
-
-    # CLD
-    date_cld = greedy_cld_from_tukey(mc_date, tukey_date_res)
-    geno_cld = greedy_cld_from_tukey(mc_geno, tukey_geno)
-    st.write("### Compact Letter Display (approx.) — Date")
-    st.dataframe(date_cld)
-    st.write("### Compact Letter Display (approx.) — Genotype (top 100 shown)")
-    st.dataframe(geno_cld.head(100))
-except Exception as e:
-    st.error(f"Tukey/CLD failed: {e}")
-    tukey_date_res = tukey_geno_res = None
-    date_cld = geno_cld = None
-
-# HSD within each Date (like agricolae HSD)
-st.markdown("## HSD within each Date (Genotype comparisons per Date)")
-try:
-    hsd_results = []
-    for d, sub in df_long.groupby("Date"):
-        if sub['Genotype'].nunique() > 1:
-            mc = MultiComparison(sub['Value'], sub['Genotype'])
-            res = mc.tukeyhsd()
-            # store summary table as DataFrame
-            rows = res._results_table.data[1:]
-            table_df = pd.DataFrame(rows, columns=res._results_table.data[0])
-            table_df['Date'] = d
-            hsd_results.append(table_df)
-    if hsd_results:
-        hsd_df = pd.concat(hsd_results, ignore_index=True)
-        st.dataframe(hsd_df.head(200))
-        download_button_df(hsd_df, "hsd_by_date.csv", "Download HSD-by-Date CSV")
+if uploaded_file:
+    # Read file
+    if uploaded_file.name.endswith('.csv'):
+        data = pd.read_csv(uploaded_file)
     else:
-        st.write("No HSD results (not enough groups).")
-except Exception as e:
-    st.warning(f"Per-Date HSD failed: {e}")
+        data = pd.read_excel(uploaded_file)
 
-# ---------- Publication-quality plots ----------
-st.markdown("## Plots (high-resolution)")
+    st.subheader("Data Preview")
+    st.write(data.head())
 
-# Interaction plot: one line per genotype
-fig1, ax1 = plt.subplots(figsize=(12,6))
-for name, grp in df_long.groupby("Genotype"):
-    # get sorted by Date order
-    x = [list(df_long['Date'].cat.categories).index(v) for v in grp['Date']]
-    # ensure alignment by Date categories sequence
-    vals = grp.groupby('Date')['Value'].mean().reindex(df_long['Date'].cat.categories).values
-    ax1.plot(range(len(vals)), vals, marker='o', linewidth=0.9, alpha=0.6)
-ax1.set_xticks(range(len(df_long['Date'].cat.categories)))
-ax1.set_xticklabels(list(df_long['Date'].cat.categories))
-ax1.set_xlabel("Date (main plot)")
-ax1.set_ylabel("Value")
-ax1.set_title("Interaction plot: Date × Genotype (line per genotype)")
-ax1.grid(True, linestyle=':', linewidth=0.4)
-st.pyplot(fig1)
-buf = fig_to_bytes(fig1, fmt="png")
-st.download_button("Download interaction plot (PNG)", data=buf, file_name="interaction_plot.png", mime="image/png")
+    # ------------------------------
+    # COLUMN SELECTION
+    # ------------------------------
+    st.sidebar.header("Select Columns for Analysis")
+    main_factor = st.sidebar.selectbox("Select Main Plot Factor (e.g., Drought Levels):", data.columns)
+    sub_factor = st.sidebar.selectbox("Select Sub Plot Factor (e.g., Genotypes):", data.columns)
+    replication = st.sidebar.selectbox("Select Replication Column:", data.columns)
+    response_var = st.sidebar.selectbox("Select Response Variable:", data.columns)
 
-# Faceted boxplots (one subplot per genotype) — careful with many genotypes
-genotypes = df_long['Genotype'].cat.categories.tolist()
-n = len(genotypes)
-cols = 5
-rows = int(np.ceil(n / cols))
-fig2, axes = plt.subplots(rows, cols, figsize=(cols*3, rows*2.5), sharey=True)
-axes = axes.flatten()
-for i, g in enumerate(genotypes):
-    ax = axes[i]
-    sub = df_long[df_long['Genotype'] == g]
-    # boxplot per Date
-    data_to_plot = [sub[sub['Date'] == d]['Value'].values for d in df_long['Date'].cat.categories]
-    ax.boxplot(data_to_plot, labels=list(df_long['Date'].cat.categories))
-    ax.set_title(str(g), fontsize=8)
-    ax.tick_params(axis='x', labelrotation=45, labelsize=7)
-for j in range(i+1, len(axes)):
-    axes[j].axis('off')
-fig2.suptitle("Per-genotype distributions across Dates (faceted boxplots)")
-st.pyplot(fig2)
-buf2 = fig_to_bytes(fig2, fmt="png")
-st.download_button("Download faceted boxplots (PNG)", data=buf2, file_name="faceted_boxplots.png", mime="image/png")
+    if main_factor and sub_factor and replication and response_var:
+        st.markdown("### Step 1: ANOVA Model Fitting")
+        
+        # ------------------------------
+        # MODEL FITTING
+        # ------------------------------
+        formula = f"{response_var} ~ C({main_factor}) * C({sub_factor}) + C({replication})"
+        model = ols(formula, data=data).fit()
+        anova_table = sm.stats.anova_lm(model, typ=2)
+        
+        st.write("**ANOVA Table:**")
+        st.dataframe(anova_table)
 
-# Genotype means with SE and CLD (EMM-like)
-geno_means = df_long.groupby("Genotype")['Value'].agg(['mean', 'sem']).reset_index().rename(columns={'sem':'se'})
-# merge CLD if available
-if geno_cld is not None:
-    geno_plot_df = geno_means.merge(geno_cld.rename(columns={"level":"Genotype"}), how='left', left_on="Genotype", right_on="Genotype")
+        # Interpretation
+        st.markdown("**Interpretation:**")
+        st.write("""
+        - If p-value < 0.05 for a factor, it means the factor has a statistically significant effect on the response variable.
+        - Interaction term indicates whether the effect of one factor depends on the level of another.
+        """)
+
+        # ------------------------------
+        # Tukey HSD for sub_factor
+        # ------------------------------
+        st.markdown("### Step 2: Tukey HSD Test for Genotypes")
+        tukey = pairwise_tukeyhsd(endog=data[response_var], groups=data[sub_factor], alpha=0.05)
+        st.text(tukey.summary())
+
+        # Interpretation
+        st.markdown("**Interpretation:**")
+        st.write("""
+        - Groups sharing the same letter are not significantly different at 5% significance level.
+        - Significant differences indicate which genotypes perform differently under the given conditions.
+        """)
+
+        # ------------------------------
+        # Group Means for Best Genotype
+        # ------------------------------
+        group_means = data.groupby(sub_factor)[response_var].mean().sort_values(ascending=False)
+        best_genotype = group_means.index[0]
+        second_best = group_means.index[1]
+        best_value = group_means.iloc[0]
+        second_value = group_means.iloc[1]
+        advantage = ((best_value - second_value) / second_value) * 100
+
+        st.markdown("### Step 3: Best Genotype Identification")
+        st.write(f"**Best Genotype:** {best_genotype} with mean {response_var} = {best_value:.2f}")
+        st.write(f"It performs **{advantage:.2f}% better** than the second-best genotype ({second_best}).")
+
+        # ------------------------------
+        # Visualization Section
+        # ------------------------------
+        st.markdown("### Step 4: Visualizations")
+
+        # Boxplot
+        st.subheader("Boxplot: Genotype vs Response")
+        fig1, ax1 = plt.subplots(figsize=(8, 6))
+        sns.boxplot(x=sub_factor, y=response_var, data=data, ax=ax1)
+        ax1.set_title(f"{sub_factor} vs {response_var}")
+        plt.xticks(rotation=45)
+        st.pyplot(fig1)
+
+        st.write("**Interpretation:** The spread of values for each genotype is shown. Narrow boxes indicate stability; higher medians indicate better performance.")
+
+        # Interaction Plot
+        st.subheader("Interaction Plot: Main Factor x Sub Factor")
+        fig2, ax2 = plt.subplots(figsize=(8, 6))
+        means = data.groupby([main_factor, sub_factor])[response_var].mean().unstack()
+        means.T.plot(ax=ax2, marker='o')
+        ax2.set_title("Interaction between Main Plot and Genotypes")
+        ax2.set_ylabel(response_var)
+        st.pyplot(fig2)
+
+        st.write("**Interpretation:** Lines crossing indicate interaction effects. Parallel lines indicate no interaction.")
+
+        # Bar Chart of Means
+        st.subheader("Mean Performance of Genotypes")
+        fig3, ax3 = plt.subplots(figsize=(8, 6))
+        group_means.plot(kind='bar', ax=ax3)
+        ax3.set_ylabel(f"Mean {response_var}")
+        ax3.set_title("Genotype Performance")
+        st.pyplot(fig3)
+
+        st.write(f"**Interpretation:** {best_genotype} stands out as the top performer, with a clear margin over others.")
+
+        # Download Results
+        st.markdown("### Download Results")
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            data.to_excel(writer, sheet_name="Raw Data", index=False)
+            anova_table.to_excel(writer, sheet_name="ANOVA")
+            pd.DataFrame(tukey.summary().data).to_excel(writer, sheet_name="TukeyHSD", index=False)
+            pd.DataFrame(group_means).to_excel(writer, sheet_name="Genotype Means")
+        st.download_button("Download Results as Excel", data=output.getvalue(), file_name="ANOVA_Tukey_Results.xlsx")
+
 else:
-    geno_plot_df = geno_means.copy()
-    geno_plot_df['cld'] = ""
-
-# sort by mean desc for plotting clarity
-geno_plot_df = geno_plot_df.sort_values('mean', ascending=False).reset_index(drop=True)
-
-fig3, ax3 = plt.subplots(figsize=(14,6))
-ax3.bar(range(len(geno_plot_df)), geno_plot_df['mean'])
-ax3.errorbar(range(len(geno_plot_df)), geno_plot_df['mean'], yerr=geno_plot_df['se'].fillna(0), fmt='none', capsize=3)
-ax3.set_xticks(range(len(geno_plot_df)))
-ax3.set_xticklabels(geno_plot_df['Genotype'], rotation=90, fontsize=8)
-ax3.set_ylabel("Estimated mean (EMM-like)")
-ax3.set_title("Genotype estimated means with SE and CLD (approx.)")
-# place CLD labels
-for i, r in geno_plot_df.iterrows():
-    lbl = r.get('cld', '')
-    ax3.text(i, r['mean'] + (r['se'] if not np.isnan(r['se']) else 0.1), str(lbl), ha='center', va='bottom', fontsize=7)
-ax3.grid(axis='y', linestyle=':', linewidth=0.4)
-st.pyplot(fig3)
-buf3 = fig_to_bytes(fig3, fmt="png")
-st.download_button("Download genotype means plot (PNG)", data=buf3, file_name="genotype_means.png", mime="image/png")
-# also provide CSV
-download_button_df(geno_plot_df, "genotype_means_cld.csv", "Download genotype means + CLD (CSV)")
-
-# Date means with SE and CLD
-date_means = df_long.groupby("Date")['Value'].agg(['mean','sem']).reset_index().rename(columns={'sem':'se'})
-if date_cld is not None:
-    date_plot_df = date_means.merge(date_cld.rename(columns={"level":"Date"}), how='left', left_on="Date", right_on="Date")
-else:
-    date_plot_df = date_means.copy()
-    date_plot_df['cld'] = ""
-
-fig4, ax4 = plt.subplots(figsize=(6,5))
-ax4.bar(range(len(date_plot_df)), date_plot_df['mean'], width=0.5)
-ax4.errorbar(range(len(date_plot_df)), date_plot_df['mean'], yerr=date_plot_df['se'].fillna(0), fmt='none', capsize=4)
-ax4.set_xticks(range(len(date_plot_df)))
-ax4.set_xticklabels(date_plot_df['Date'], fontsize=10)
-ax4.set_ylabel("Estimated mean (EMM-like)")
-ax4.set_title("Date estimated means with SE and CLD (approx.)")
-for i, r in date_plot_df.iterrows():
-    ax4.text(i, r['mean'] + (r['se'] if not np.isnan(r['se']) else 0.05), str(r.get('cld','')), ha='center', va='bottom')
-ax4.grid(axis='y', linestyle=':', linewidth=0.4)
-st.pyplot(fig4)
-buf4 = fig_to_bytes(fig4, fmt="png")
-st.download_button("Download date means plot (PNG)", data=buf4, file_name="date_means.png", mime="image/png")
-download_button_df(date_plot_df, "date_means_cld.csv", "Download date means + CLD (CSV)")
-
-# Mean ± SE by Date × Genotype (grouped bar) for top N genotypes to avoid clutter
-st.markdown("### Mean ± SE by Date × Genotype (top N genotypes by overall mean)")
-top_n = st.slider("Number of top genotypes to show", min_value=4, max_value=min(19, len(geno_plot_df)), value=8)
-top_genos = geno_plot_df.head(top_n)['Genotype'].tolist()
-subset = df_long[df_long['Genotype'].isin(top_genos)]
-summary = subset.groupby(['Genotype','Date'])['Value'].agg(['mean','sem']).reset_index().rename(columns={'sem':'se','mean':'Value'})
-fig5, ax5 = plt.subplots(figsize=(max(8, top_n*0.8), 5))
-genos = summary['Genotype'].unique()
-dates = sorted(summary['Date'].unique())
-x = np.arange(len(genos))
-width = 0.2
-for i, d in enumerate(dates):
-    vals = summary[summary['Date']==d]['Value'].values
-    errs = summary[summary['Date']==d]['se'].values
-    ax5.bar(x + (i - (len(dates)-1)/2)*width, vals, width=width, label=str(d))
-    ax5.errorbar(x + (i - (len(dates)-1)/2)*width, vals, yerr=errs, fmt='none', capsize=3)
-ax5.set_xticks(x)
-ax5.set_xticklabels(genos, rotation=90)
-ax5.set_ylabel("Mean value")
-ax5.set_title(f"Mean ± SE by Date and Genotype (top {top_n})")
-ax5.legend(title="Date")
-ax5.grid(axis='y', linestyle=':', linewidth=0.4)
-st.pyplot(fig5)
-buf5 = fig_to_bytes(fig5, fmt="png")
-st.download_button("Download grouped means plot (PNG)", data=buf5, file_name="means_by_date_genotype.png", mime="image/png")
-# Save summary csv
-download_button_df(summary, "mean_se_by_date_genotype_topN.csv", "Download mean±SE (CSV)")
-
-st.markdown("---")
-st.markdown("### Notes & Limitations")
-st.markdown(textwrap.dedent("""
-- The app attempts to reflect split-plot structure by fitting a Mixed Linear Model (random Rep and Rep:Date vc).
-- For pairwise comparisons and compact letters we use Tukey HSD on raw observations with a greedy CLD algorithm (approximation). R's `emmeans` + `multcompView` or `agricolae` will give results that are sometimes slightly different.
-- If you need exact equivalence with R's split-plot ANOVA + emmeans, run the R script in R (I can provide an RMarkdown that renders a publication-ready PDF).
-- Plots are saved/downloadable at high resolution (PNG). For journal submission you can export SVG from matplotlib by changing `fmt='svg'` in the download helper.
-- For highly unbalanced designs or singularities, MixedLM may fail; OLS is used as a robust complement for EMM-like estimation and Tukey.
-"""))
-
-st.success("Analysis complete. Use download buttons above to save results & plots.")
+    st.info("Please upload a dataset to start the analysis.")
