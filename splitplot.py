@@ -12,7 +12,7 @@ from statsmodels.regression.mixed_linear_model import MixedLM
 from statsmodels.stats.multicomp import pairwise_tukeyhsd, MultiComparison
 from scipy import stats
 
-# ---------- Helper functions (Same as before) ----------
+# ---------- Helper functions ----------
 
 def read_input_file(uploaded_file):
     """Read csv/xlsx/xls into pandas DataFrame."""
@@ -75,15 +75,12 @@ def fit_mixedlm(df_long):
     Fit a Mixed Linear Model approximating split-plot:
     Random intercept for Rep (block) and variance component for Rep:Date (whole-plot).
     """
-    # Create numeric indices for categories if needed for MixedLM internals
-    # Use groups = Rep, vc for Rep:Date
     try:
         vc = {"RepDate": "0 + C(Rep):C(Date)"}
         md = MixedLM.from_formula("Value ~ C(Date)*C(Genotype)", groups="Rep", vc_formula=vc, data=df_long)
         mdf = md.fit(reml=True)
         return mdf
     except Exception as e:
-        # fallback: try simpler random intercept only
         try:
             md = MixedLM.from_formula("Value ~ C(Date)*C(Genotype)", groups="Rep", data=df_long)
             mdf = md.fit(reml=True)
@@ -95,29 +92,26 @@ def tukey_tests(df_long, factor):
     """Run Tukey HSD using statsmodels MultiComparison."""
     mc = MultiComparison(df_long["Value"], df_long[factor])
     res = mc.tukeyhsd()
-    # return results object and the MultiComparison
     return res, mc
 
 def greedy_cld_from_tukey(mc: MultiComparison, tukey_res):
     """
     Approximate CLD (compact letter display) from tukeyhsd results.
-    This is a greedy assignment and approximate (use R's multcompView/agricolae in R for exact behaviour).
     """
+    # Defensive check: if no groups, return an empty DataFrame
+    if not hasattr(mc, 'groupsunique') or len(mc.groupsunique) == 0:
+        return pd.DataFrame(columns=["level", "cld", "mean"])
+        
     groups = list(mc.groupsunique)
-    # Obtain pairwise info
     table = tukey_res._results_table.data[1:]
-    # Build "not different" map (True if NOT significantly different)
     not_diff = {g:{} for g in groups}
     for r in table:
         g1, g2, meandiff, p_adj, lower, upper, reject = r
-        # reject==True means significantly different
         not_diff[g1][g2] = (not reject)
         not_diff[g2][g1] = (not reject)
-    # pair self
     for g in groups:
         not_diff[g][g] = True
-    # compute group means for ordering
-    means = df_long.groupby(mc.groups)[ "Value"].mean().reindex(groups)
+    means = df_long.groupby(mc.groups)["Value"].mean().reindex(groups)
     sorted_groups = list(means.sort_values(ascending=False).index)
     letters = {}
     current_letter = ord('a')
@@ -126,11 +120,9 @@ def greedy_cld_from_tukey(mc: MultiComparison, tukey_res):
             continue
         letter = chr(current_letter)
         letters[g] = letters.get(g, "") + letter
-        # try to add other groups to this letter
         for h in sorted_groups:
             if h in letters:
                 continue
-            # check whether h is not significantly different from ALL groups already assigned this letter
             assigned = [gg for gg,lab in letters.items() if letter in lab]
             ok = True
             for gg in assigned:
@@ -140,9 +132,7 @@ def greedy_cld_from_tukey(mc: MultiComparison, tukey_res):
             if ok:
                 letters[h] = letters.get(h, "") + letter
         current_letter += 1
-    # create DataFrame
-    cld_df = pd.DataFrame({"group": sorted_groups, "cld": [letters.get(g, "") for g in sorted_groups], "mean": means.loc[sorted_groups].values})
-    cld_df = cld_df.rename(columns={"group":"level"})
+    cld_df = pd.DataFrame({"level": sorted_groups, "cld": [letters.get(g, "") for g in sorted_groups], "mean": means.loc[sorted_groups].values})
     return cld_df
 
 def download_button_df(df, filename, button_label):
@@ -156,31 +146,23 @@ def fig_to_bytes(fig, fmt="png", dpi=300):
     return buf
 
 # ---------- New Interpretations Function ----------
-def add_interpretations(df_long, anova_table, geno_cld, date_cld):
+def add_interpretations(anova_table, geno_cld, date_cld):
     st.markdown("### 📊 Interpretations of Results")
     st.markdown("""
     Here's a simple guide to help you understand the statistical output and plots.
     """)
-
-    # ANOVA Interpretation
     st.markdown("#### ANOVA Table")
     if anova_table is not None:
         p_date = anova_table.loc['C(Date)', 'PR(>F)']
         p_geno = anova_table.loc['C(Genotype)', 'PR(>F)']
         p_interaction = anova_table.loc['C(Date):C(Genotype)', 'PR(>F)']
-
         st.markdown(f"""
-        -   **Date effect (P={p_date:.4f})**: The p-value for Date tells us if there's a significant difference between the overall averages of the dates.
-            -   **Interpretation**: {'There is a significant difference between dates.' if p_date < 0.05 else 'There is no significant difference between dates.'} This means that the trait value changed over time.
-        -   **Genotype effect (P={p_geno:.4f})**: This p-value indicates if the genotypes, on average, are different from each other.
-            -   **Interpretation**: {'There is a significant difference among genotypes.' if p_geno < 0.05 else 'There is no significant difference among genotypes.'} This is a key finding for breeding/selection.
-        -   **Interaction effect (P={p_interaction:.4f})**: The interaction p-value tells us if the performance of genotypes changes from date to date. In other words, is one genotype the best on all dates, or does their ranking change?
-            -   **Interpretation**: {'There is a significant interaction.' if p_interaction < 0.05 else 'There is no significant interaction.'} A significant interaction means you should look at the results per date (HSD per Date) to understand the full picture.
+        -   **Date effect (P={p_date:.4f})**: The p-value for Date tells us if there's a significant difference between the overall averages of the dates. **Interpretation**: {'There is a significant difference between dates.' if p_date < 0.05 else 'There is no significant difference between dates.'}
+        -   **Genotype effect (P={p_geno:.4f})**: This p-value indicates if the genotypes, on average, are different from each other. **Interpretation**: {'There is a significant difference among genotypes.' if p_geno < 0.05 else 'There is no significant difference among genotypes.'}
+        -   **Interaction effect (P={p_interaction:.4f})**: The interaction p-value tells us if the performance of genotypes changes from date to date. **Interpretation**: {'There is a significant interaction.' if p_interaction < 0.05 else 'There is no significant interaction.'} A significant interaction means you should look at the results per date to understand the full picture.
         """)
     else:
         st.info("ANOVA table not available for interpretation.")
-    
-    # "Best" Genotype and Date
     st.markdown("---")
     st.markdown("#### 🏆 Top Performers")
     if geno_cld is not None and not geno_cld.empty:
@@ -195,7 +177,6 @@ def add_interpretations(df_long, anova_table, geno_cld, date_cld):
             <p style="margin: 0; font-style: italic;">It's in the letter group '{best_cld}' meaning it is statistically similar to other genotypes with the same letter.</p>
         </div>
         """, unsafe_allow_html=True)
-    
     if date_cld is not None and not date_cld.empty:
         best_date_row = date_cld.iloc[0]
         best_date = best_date_row['level']
@@ -208,31 +189,27 @@ def add_interpretations(df_long, anova_table, geno_cld, date_cld):
             <p style="margin: 0; font-style: italic;">This date performed statistically similarly to others with the same letter '{best_cld}'.</p>
         </div>
         """, unsafe_allow_html=True)
-
-    # Plot Interpretations
     st.markdown("---")
     st.markdown("#### 🖼️ Understanding the Plots")
     st.markdown("""
-    -   **Interaction Plot**: Each line represents a single genotype. If the lines are parallel, it suggests there's no interaction—all genotypes are behaving similarly over time. If the lines cross or have different slopes, it confirms a significant interaction, meaning some genotypes perform better than others at different times.
-    -   **Faceted Boxplots**: These show the distribution of data for each genotype across all dates. A tall boxplot means high variability, while a short one means consistent performance. This helps visualize how stable a genotype's performance is.
-    -   **Genotype & Date Means Plots**: The bars show the average value for each genotype or date. The vertical lines (error bars) represent the standard error (SE), showing the precision of the mean. **The letters (CLD)** on top indicate which groups are statistically different from each other. Groups with at least one letter in common are **not** statistically different.
+    -   **Interaction Plot**: If lines are parallel, there's no interaction. If they cross or have different slopes, it means there's a significant interaction.
+    -   **Faceted Boxplots**: These help visualize variability. A tall boxplot means high variability.
+    -   **Genotype & Date Means Plots**: The letters (CLD) on top of the bars indicate statistical similarity. Groups with at least one letter in common are **not** statistically different.
     """)
     st.markdown("---")
 
 
-# ---------- Streamlit UI (Revised) ----------
-
+# ---------- Streamlit UI ----------
 st.set_page_config(layout="wide", page_title="Split-Plot Analysis App")
 st.title("🌱 Split-Plot Analysis App")
 st.markdown("""
-This app performs split-plot analysis for data from experiments where one factor (like Date) is a **main plot** and another (like Genotype) is a **subplot**.
-It's designed to work with data formatted with columns named like `d1_r1`, `d1_r2`, `d2_r1`, etc.
--   **Main-plot**: `Date` (e.g., d1, d2, d3)
--   **Sub-plot**: `Genotype` (e.g., g1..g19)
--   **Replications**: `Rep` (e.g., r1, r2)
-
-Upload your file (.csv, .xlsx, .xls) or use the example dataset below.
+This app performs split-plot analysis for data with columns named like `d1_r1`, `d1_r2`, etc.
+- **Main-plot** = Date (d1, d2, d3)
+- **Sub-plot** = Genotype (g1..g19)
+- **Replications** = r1, r2
+Upload your file (.csv, .xlsx, .xls) or use the example dataset.
 """)
+
 # Example dataset
 example_csv = """Genotype,d1_r1,d1_r2,d2_r1,d2_r2,d3_r1,d3_r2,Mean
 g1,36.86,37.97,38.47,37.47,40.87,42.40,39.01
@@ -255,12 +232,14 @@ g17,42.14,43.49,44.14,43.74,47.47,48.33,44.88
 g18,37.38,31.96,42.46,43.79,39.74,39.24,39.10
 g19,36.62,36.98,36.18,36.86,40.56,38.92,37.69
 """
+
 uploaded_file = st.file_uploader("Upload CSV/XLSX file", type=["csv","xlsx","xls"])
 use_example = st.checkbox("Use example dataset (ignore upload)", value=True)
 
 if uploaded_file is None and not use_example:
     st.info("Upload a file or check 'Use example dataset'.")
     st.stop()
+
 if use_example:
     data = pd.read_csv(StringIO(example_csv))
 else:
@@ -272,13 +251,14 @@ else:
 
 st.subheader("Raw Data Preview")
 st.dataframe(data.head())
-# Clean + pivot
+
 try:
     data2 = safe_drop_mean(data)
     df_long = pivot_to_long(data2)
 except Exception as e:
     st.error(f"Data transformation failed: {e}")
     st.stop()
+
 st.subheader("Data in Long Format")
 st.dataframe(df_long.head())
 st.markdown(f"- **Observations**: **{len(df_long)}** | **Dates**: {list(df_long['Date'].cat.categories)} | **Genotypes**: {len(df_long['Genotype'].cat.categories)} | **Replications**: {list(df_long['Rep'].cat.categories)}")
@@ -288,6 +268,7 @@ st.markdown("---")
 st.markdown("## 🔬 Statistical Analysis")
 st.info("We'll run a Mixed Linear Model to approximate the split-plot design and an OLS model to get the ANOVA table and Tukey tests.")
 col1, col2 = st.columns(2)
+
 with col1:
     st.write("### Mixed Linear Model")
     run_mixed = st.button("Fit MixedLM")
@@ -321,11 +302,12 @@ st.markdown("## 📊 Post-hoc Tests & Visualizations")
 try:
     tukey_date_res, mc_date = tukey_tests(df_long, "Date")
     tukey_geno_res, mc_geno = tukey_tests(df_long, "Genotype")
-    st.write("### Tukey HSD — Date")
-    st.text(tukey_date_res.summary())
-    st.write("### Tukey HSD — Genotype (first 200 comparisons shown)")
-    st.text(tukey_geno_res.summary())
 
+    st.write("### Tukey HSD — Date")
+    st.dataframe(pd.DataFrame(tukey_date_res.summary().data[1:], columns=tukey_date_res.summary().data[0]))
+    st.write("### Tukey HSD — Genotype (first 200 comparisons shown)")
+    st.dataframe(pd.DataFrame(tukey_geno_res.summary().data[1:], columns=tukey_geno_res.summary().data[0]))
+    
     date_cld = greedy_cld_from_tukey(mc_date, tukey_date_res)
     geno_cld = greedy_cld_from_tukey(mc_geno, tukey_geno_res)
     st.write("### Compact Letter Display (approx.) — Date")
@@ -337,8 +319,7 @@ except Exception as e:
     tukey_date_res = tukey_geno_res = None
     date_cld = geno_cld = None
 
-# Add the interpretations section right after the results
-add_interpretations(df_long, anova_table, geno_cld, date_cld)
+add_interpretations(anova_table, geno_cld, date_cld)
 
 # HSD within each Date
 st.markdown("---")
@@ -405,12 +386,18 @@ st.download_button("Download faceted boxplots (PNG)", data=buf2, file_name="face
 
 # Genotype means with SE and CLD
 geno_means = df_long.groupby("Genotype")['Value'].agg(['mean', 'sem']).reset_index().rename(columns={'sem':'se'})
-if geno_cld is not None:
+if geno_cld is not None and not geno_cld.empty:
     geno_plot_df = geno_means.merge(geno_cld.rename(columns={"level":"Genotype"}), how='left', left_on="Genotype", right_on="Genotype")
 else:
     geno_plot_df = geno_means.copy()
     geno_plot_df['cld'] = ""
-geno_plot_df = geno_plot_df.sort_values('mean', ascending=False).reset_index(drop=True)
+# The fix: Ensure 'mean' column exists before sorting
+if 'mean' in geno_plot_df.columns:
+    geno_plot_df = geno_plot_df.sort_values('mean', ascending=False).reset_index(drop=True)
+else:
+    # If for some reason 'mean' is missing, fallback to Genotype sort
+    geno_plot_df = geno_plot_df.sort_values('Genotype').reset_index(drop=True)
+
 fig3, ax3 = plt.subplots(figsize=(14,6))
 ax3.bar(range(len(geno_plot_df)), geno_plot_df['mean'])
 ax3.errorbar(range(len(geno_plot_df)), geno_plot_df['mean'], yerr=geno_plot_df['se'].fillna(0), fmt='none', capsize=3)
@@ -429,7 +416,7 @@ download_button_df(geno_plot_df, "genotype_means_cld.csv", "Download genotype me
 
 # Date means with SE and CLD
 date_means = df_long.groupby("Date")['Value'].agg(['mean','sem']).reset_index().rename(columns={'sem':'se'})
-if date_cld is not None:
+if date_cld is not None and not date_cld.empty:
     date_plot_df = date_means.merge(date_cld.rename(columns={"level":"Date"}), how='left', left_on="Date", right_on="Date")
 else:
     date_plot_df = date_means.copy()
